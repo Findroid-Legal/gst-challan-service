@@ -21,7 +21,10 @@
 
 import express, { Request, Response, NextFunction } from 'express';
 import { randomUUID } from 'crypto';
-import { chromium, BrowserContext, Page } from 'playwright';
+import { chromium, BrowserContext, Page, Download } from 'playwright';
+import { chromium as chromiumStealth } from 'playwright-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+(chromiumStealth as any).use(StealthPlugin());
 import path from 'path';
 import fs from 'fs';
 import * as dotenv from 'dotenv';
@@ -922,6 +925,339 @@ app.get('/payment/:cpin/status', async (req: Request, res: Response) => {
     // Portal may 401/403 for unauthenticated status check — return PENDING
     res.json({ cpin, status: 'PENDING', message: 'Status check unavailable — check GST portal.' });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IT PORTAL — Income Tax portal automation
+// ═══════════════════════════════════════════════════════════════════════════
+
+type ITState = 'pending_login' | 'logging_in' | 'logged_in' | 'fetching' | 'ready' | 'downloading' | 'error';
+
+interface ITReturn {
+  ay: string;         // "A.Y. 2025-26"
+  itrType: string;    // "ITR-6"
+  ackNo: string;
+  filingDate: string;
+  filingType: string;
+  status: string;
+  statusDate: string;
+}
+
+interface ITDownloadItem {
+  ay: string;
+  ayIndex: number;
+  type: 'receipt' | 'json' | 'intimation' | 'form';
+  state: 'pending' | 'downloading' | 'done' | 'error';
+  base64?: string;
+  filename?: string;
+  error?: string;
+}
+
+interface ITSession {
+  id: string;
+  context: BrowserContext;
+  page: Page;
+  state: ITState;
+  logs: string[];
+  returns: ITReturn[];
+  downloads: ITDownloadItem[];
+  error?: string;
+  createdAt: number;
+}
+
+const itSessions = new Map<string, ITSession>();
+
+function itLog(s: ITSession, msg: string) {
+  const line = `${new Date().toISOString().slice(11, 19)} ${msg}`;
+  s.logs.push(line);
+  console.log(`[IT:${s.id.slice(0, 8)}] ${msg}`);
+}
+
+function cleanupIT(s: ITSession) {
+  try { s.context.close(); } catch {}
+  itSessions.delete(s.id);
+}
+
+setInterval(() => {
+  for (const [, s] of itSessions) {
+    if (Date.now() - s.createdAt > SESSION_TTL) cleanupIT(s);
+  }
+}, 60_000);
+
+async function downloadToBase64(download: any): Promise<string> {
+  const stream = await download.createReadStream();
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    stream.on('data', (c: Buffer) => chunks.push(c));
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString('base64')));
+    stream.on('error', reject);
+  });
+}
+
+async function navigateToFiledReturns(s: ITSession) {
+  const page = s.page;
+  // Dismiss any dialogs
+  try { await page.getByRole('button', { name: 'No' }).click({ timeout: 2000 }); } catch {}
+  try { await page.locator('.cdk-overlay-backdrop').click({ timeout: 2000 }); } catch {}
+
+  await page.getByRole('menuitem', { name: 'e-File' }).click();
+  await page.waitForTimeout(800);
+  await page.getByRole('menuitem', { name: /^Income Tax Returns$/ }).hover();
+  await page.locator('text=View Filed Returns').waitFor({ state: 'visible', timeout: 5000 });
+  await page.locator('text=View Filed Returns').click();
+  // Wait for spinner
+  await page.waitForSelector('mat-spinner, .mat-spinner, [class*="spinner"]', { state: 'hidden', timeout: 30000 }).catch(() => {});
+  await page.waitForSelector('text=Filings till date', { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(500);
+}
+
+function parseITReturns(bodyText: string): ITReturn[] {
+  const returns: ITReturn[] = [];
+  const sections = bodyText.match(/A\.Y\.\s*\d{4}-\d{2,4}[\s\S]{0,800}/g) || [];
+  for (const section of sections) {
+    const ayMatch = section.match(/A\.Y\.\s*(\d{4}-\d{2,4})/);
+    const itrMatch = section.match(/ITR\s*:\s*(ITR-\w+)/);
+    const ackMatch = section.match(/Acknowledgement\s*No\s*[:\s]+(\d+)/);
+    const filingDateMatch = section.match(/(?:Filed|Filing Date)\s*[:\s]+([A-Z][a-z]+ \d+,\s*\d{4})/);
+    const statusMatch = section.match(/(Processed with[^.]+|Under Processing|Successfully e-verified|Defective|Filed)/);
+    const statusDateMatch = section.match(/(?:Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov)\s+\d+,\s+\d{4}/);
+    const filingTypeMatch = section.match(/(Original|Revised|Belated|Updated)/);
+    if (ayMatch) {
+      returns.push({
+        ay: `A.Y. ${ayMatch[1]}`,
+        itrType: itrMatch?.[1] ?? '',
+        ackNo: ackMatch?.[1] ?? '',
+        filingDate: filingDateMatch?.[1] ?? '',
+        filingType: filingTypeMatch?.[1] ?? 'Original',
+        status: statusMatch?.[1]?.trim() ?? '',
+        statusDate: statusDateMatch?.[0] ?? '',
+      });
+    }
+  }
+  return returns;
+}
+
+// POST /it/session/start
+app.post('/it/session/start', async (req: Request, res: Response) => {
+  const id = randomUUID();
+  let context: BrowserContext | null = null;
+  try {
+    const browser = await chromiumStealth.launch({ headless: true, args: STEALTH_ARGS });
+    context = await browser.newContext({ userAgent: USER_AGENT, viewport: { width: 1280, height: 900 }, locale: 'en-IN', timezoneId: 'Asia/Kolkata', acceptDownloads: true });
+    await context.addInitScript(STEALTH_SCRIPT);
+    const page = await context.newPage();
+
+    await page.goto('https://eportal.incometax.gov.in/iec/foservices/#/login', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForSelector('[placeholder*="User ID"], input[formcontrolname="userId"]', { timeout: 15000 });
+
+    const s: ITSession = { id, context, page, state: 'pending_login', logs: [], returns: [], downloads: [], createdAt: Date.now() };
+    itSessions.set(id, s);
+    itLog(s, 'Session started');
+    res.json({ sessionId: id });
+  } catch (err: any) {
+    try { context?.close(); } catch {}
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /it/session/:id/login
+app.post('/it/session/:id/login', async (req: Request, res: Response) => {
+  const s = itSessions.get(String(req.params.id));
+  if (!s) return void res.status(404).json({ error: 'Session not found' });
+  const { pan, password } = req.body as { pan: string; password: string };
+  if (!pan || !password) return void res.status(400).json({ error: 'pan and password required' });
+
+  s.state = 'logging_in';
+  try {
+    const page = s.page;
+
+    // Fill PAN
+    const panField = page.getByRole('textbox', { name: 'Enter your User ID*' });
+    await panField.click();
+    await panField.pressSequentially(pan, { delay: 80 });
+    await panField.blur();
+    await page.waitForTimeout(400);
+    await page.getByRole('button', { name: 'Continue' }).click();
+    await page.waitForTimeout(2500);
+    itLog(s, `PAN entered, URL: ${page.url()}`);
+
+    // Secure access checkbox
+    try {
+      await page.getByRole('checkbox', { name: 'Please confirm your secure' }).click({ timeout: 4000 });
+      itLog(s, 'Secure access checkbox clicked');
+    } catch {}
+
+    // Fill password
+    const pwField = page.getByRole('textbox', { name: 'Password*' });
+    await pwField.click();
+    await pwField.pressSequentially(password, { delay: 90 });
+    await pwField.blur();
+    await page.waitForTimeout(400);
+
+    // Retry Continue up to 3x
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await page.getByRole('button', { name: 'Continue' }).click();
+      itLog(s, `Continue attempt ${attempt}`);
+      await page.waitForTimeout(2500);
+
+      // Dual login detection
+      try {
+        await page.locator('text=Dual Login Detected').waitFor({ timeout: 1500 });
+        itLog(s, 'Dual login detected → clicking Login Here');
+        await page.getByRole('button', { name: 'Login Here' }).click();
+        await page.waitForTimeout(2000);
+        break;
+      } catch {}
+
+      const errText = await page.locator('.error-message, [class*="error"]').first().innerText().catch(() => '');
+      if (errText.includes('not authenticated')) { itLog(s, `Auth error attempt ${attempt}, retrying`); continue; }
+      break;
+    }
+
+    // "Login Here" button (appears in some flows)
+    try {
+      await page.getByRole('button', { name: 'Login Here' }).waitFor({ timeout: 5000 });
+      await page.getByRole('button', { name: 'Login Here' }).click();
+      itLog(s, '"Login Here" clicked');
+      await page.waitForTimeout(3000);
+    } catch {}
+
+    const url = page.url();
+    if (!url.includes('#/dashboard')) {
+      s.state = 'error';
+      s.error = 'Login failed — did not reach dashboard';
+      return void res.status(401).json({ error: s.error });
+    }
+    s.state = 'logged_in';
+    itLog(s, 'Logged in');
+    res.json({ ok: true });
+  } catch (err: any) {
+    s.state = 'error';
+    s.error = err.message;
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /it/session/:id/returns
+app.get('/it/session/:id/returns', async (req: Request, res: Response) => {
+  const s = itSessions.get(String(req.params.id));
+  if (!s) return void res.status(404).json({ error: 'Session not found' });
+  if (s.state === 'error') return void res.status(400).json({ error: s.error });
+
+  s.state = 'fetching';
+  try {
+    await navigateToFiledReturns(s);
+    itLog(s, 'On View Filed Returns page');
+
+    const bodyText = await s.page.innerText('body').catch(() => '');
+    s.returns = parseITReturns(bodyText);
+    itLog(s, `Scraped ${s.returns.length} returns`);
+
+    s.state = 'ready';
+    res.json({ returns: s.returns });
+  } catch (err: any) {
+    s.state = 'error';
+    s.error = err.message;
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /it/session/:id/download  body: { items: [{ay, ayIndex, type}] }
+app.post('/it/session/:id/download', async (req: Request, res: Response) => {
+  const s = itSessions.get(String(req.params.id));
+  if (!s) return void res.status(404).json({ error: 'Session not found' });
+  const { items } = req.body as { items: { ay: string; ayIndex: number; type: 'receipt' | 'json' | 'intimation' }[] };
+  if (!items?.length) return void res.status(400).json({ error: 'items required' });
+
+  s.state = 'downloading';
+  const newItems: ITDownloadItem[] = items.map(i => ({ ...i, state: 'pending' }));
+  s.downloads.push(...newItems);
+  res.status(202).json({ ok: true, count: items.length });
+
+  // Run downloads async
+  (async () => {
+    try {
+      // Make sure we're on the returns page
+      if (!s.page.url().includes('itrStatus')) {
+        await navigateToFiledReturns(s);
+      }
+
+      for (const item of newItems) {
+        item.state = 'downloading';
+        itLog(s, `Downloading ${item.type} for ${item.ay} (index ${item.ayIndex})`);
+        try {
+          let btn: any;
+          if (item.type === 'receipt')    btn = s.page.getByRole('button', { name: 'Download Receipt' }).nth(item.ayIndex);
+          if (item.type === 'json')       btn = s.page.getByRole('button', { name: 'Download JSON' }).nth(item.ayIndex);
+          if (item.type === 'intimation') btn = s.page.getByRole('link', { name: /Download Intimation Order/i }).nth(item.ayIndex);
+
+          await btn.scrollIntoViewIfNeeded();
+          const [dl] = await Promise.all([
+            s.page.waitForEvent('download', { timeout: 60000 }),
+            btn.click(),
+          ]);
+          item.base64 = await downloadToBase64(dl);
+          item.filename = dl.suggestedFilename() || `${item.type}-${item.ay}.pdf`;
+          item.state = 'done';
+          itLog(s, `Done: ${item.type} for ${item.ay}`);
+        } catch (e: any) {
+          item.state = 'error';
+          item.error = e.message;
+          itLog(s, `Error: ${item.type}: ${e.message}`);
+        }
+        await s.page.waitForTimeout(500);
+      }
+      s.state = 'ready';
+    } catch (e: any) {
+      s.state = 'error';
+      s.error = e.message;
+    }
+  })();
+});
+
+// POST /it/session/:id/download-form  body: { ay, ayIndex }
+app.post('/it/session/:id/download-form', async (req: Request, res: Response) => {
+  const s = itSessions.get(String(req.params.id));
+  if (!s) return void res.status(404).json({ error: 'Session not found' });
+  const { ay, ayIndex = 0 } = req.body as { ay: string; ayIndex: number };
+
+  const item: ITDownloadItem = { ay, ayIndex, type: 'form', state: 'pending' };
+  s.downloads.push(item);
+  res.status(202).json({ ok: true });
+
+  (async () => {
+    try {
+      if (!s.page.url().includes('itrStatus')) await navigateToFiledReturns(s);
+      item.state = 'downloading';
+      itLog(s, `Downloading form for ${ay} (slow, index ${ayIndex})`);
+      const btn = s.page.getByRole('button', { name: 'Download Form' }).nth(ayIndex);
+      await btn.scrollIntoViewIfNeeded();
+      const [dl] = await Promise.all([
+        s.page.waitForEvent('download', { timeout: 60000 }),
+        btn.click(),
+      ]);
+      item.base64 = await downloadToBase64(dl);
+      item.filename = dl.suggestedFilename() || `form-${ay}.pdf`;
+      item.state = 'done';
+      itLog(s, `Form download done for ${ay}`);
+    } catch (e: any) {
+      item.state = 'error';
+      item.error = e.message;
+    }
+  })();
+});
+
+// GET /it/session/:id/status
+app.get('/it/session/:id/status', async (req: Request, res: Response) => {
+  const s = itSessions.get(String(req.params.id));
+  if (!s) return void res.status(404).json({ error: 'Session not found' });
+  res.json({
+    state: s.state,
+    logs: s.logs.slice(-20),
+    returns: s.returns,
+    downloads: s.downloads,
+    error: s.error,
+  });
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
