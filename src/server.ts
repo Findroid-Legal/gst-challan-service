@@ -144,14 +144,38 @@ async function callAngularFn(page: Page, fnName: string): Promise<boolean> {
   }, fnName);
 }
 
-// ── Fill an amount field ──────────────────────────────────────────────────────
-async function fillAmount(page: Page, head: string, amount: number): Promise<boolean> {
+// ── Per-head amount type (mirrors challan-api.ts TaxHeadAmounts) ─────────────
+interface TaxHeadAmounts {
+  tax:      number;
+  interest: number;
+  penalty:  number;
+  fee:      number;
+  other:    number;
+}
+const EMPTY_HEAD: TaxHeadAmounts = { tax: 0, interest: 0, penalty: 0, fee: 0, other: 0 };
+const toHead = (h: unknown): TaxHeadAmounts => {
+  if (!h || typeof h !== 'object') return { ...EMPTY_HEAD };
+  const o = h as Record<string, unknown>;
+  return {
+    tax:      Number(o.tax      ?? 0),
+    interest: Number(o.interest ?? 0),
+    penalty:  Number(o.penalty  ?? 0),
+    fee:      Number(o.fee      ?? 0),
+    other:    Number(o.other    ?? 0),
+  };
+};
+
+// ── Fill a single named portal input field ───────────────────────────────────
+// fieldName follows GST portal convention: {head}_{type}_amt
+// e.g. igst_tax_amt, cgst_int_amt, sgst_pen_amt, cess_fee_amt, igst_oth_amt
+async function fillField(page: Page, fieldName: string, amount: number): Promise<boolean> {
   if (amount <= 0) return true;
   const sels = [
-    `input[name="${head}_tax_amt"]`,
-    `input[name=" ${head}_tax_amt"]`,
-    `input[data-ng-model="challanData.${head}_tax_amt"]`,
-    `input[name*="${head}"][name*="tax"]`,
+    `input[name="${fieldName}"]`,
+    `input[name=" ${fieldName}"]`,           // portal sometimes has a leading space
+    `input[data-ng-model="challanData.${fieldName}"]`,
+    `input[ng-model="challanData.${fieldName}"]`,
+    `input[data-ng-model*="${fieldName}"]`,
   ];
   for (const sel of sels) {
     try {
@@ -255,12 +279,16 @@ async function fillCaptchaAndLogin(page: Page, text: string): Promise<void> {
 // ── Core challan flow (runs async after /generate is called) ──────────────────
 async function runChallanFlow(
   session: Session,
-  opts: { igst: number; cgst: number; sgst: number; cess: number;
-          interest: number; penalty: number; fee: number; payMode: string }
+  opts: {
+    igst: TaxHeadAmounts; cgst: TaxHeadAmounts;
+    sgst: TaxHeadAmounts; cess: TaxHeadAmounts;
+    payMode: string;
+  }
 ) {
   const { page } = session;
-  const { igst, cgst, sgst, cess, interest, penalty, fee, payMode } = opts;
-  const total = igst + cgst + sgst + cess + interest + penalty + fee;
+  const { igst, cgst, sgst, cess, payMode } = opts;
+  const headSum = (h: TaxHeadAmounts) => h.tax + h.interest + h.penalty + h.fee + h.other;
+  const total = headSum(igst) + headSum(cgst) + headSum(sgst) + headSum(cess);
 
   try {
     // ── SSO: Return portal ──────────────────────────────────────
@@ -353,21 +381,17 @@ async function runChallanFlow(
     }
     await page.waitForSelector('input[name*="tax_amt"], input[data-ng-model*="challanData"], input[name*="igst"]', { timeout: 12000 }).catch(() => {});
 
-    // ── Fill amounts ────────────────────────────────────────────
-    addLog(session, `Filling: IGST=${igst} CGST=${cgst} SGST=${sgst} CESS=${cess}`);
-    if (igst     > 0) await fillAmount(page, 'igst', igst);
-    if (cgst     > 0) await fillAmount(page, 'cgst', cgst);
-    if (sgst     > 0) await fillAmount(page, 'sgst', sgst);
-    if (cess     > 0) await fillAmount(page, 'cess', cess);
-    if (interest > 0) {
-      const iSels = [`input[name="igst_int_amt"]`, `input[name="cgst_int_amt"]`];
-      for (const sel of iSels) {
-        try {
-          if (await page.locator(sel).isVisible({ timeout: 800 })) {
-            await page.locator(sel).first().fill(String(interest)); break;
-          }
-        } catch {}
-      }
+    // ── Fill amounts (per head × per type, matching portal grid) ───────────────
+    addLog(session, `Filling: IGST(tax=${igst.tax} int=${igst.interest}) CGST(tax=${cgst.tax} int=${cgst.interest}) SGST(tax=${sgst.tax}) CESS(tax=${cess.tax})`);
+    const headMap: Record<string, TaxHeadAmounts> = { igst, cgst, sgst, cess };
+    // Portal field name pattern: {head}_{type}_amt
+    // types: tax, int (interest), pen (penalty), fee, oth (other)
+    for (const [head, vals] of Object.entries(headMap)) {
+      await fillField(page, `${head}_tax_amt`, vals.tax);
+      await fillField(page, `${head}_int_amt`, vals.interest);
+      await fillField(page, `${head}_pen_amt`, vals.penalty);
+      await fillField(page, `${head}_fee_amt`, vals.fee);
+      await fillField(page, `${head}_oth_amt`, vals.other);
     }
 
     // ── E-Payment ───────────────────────────────────────────────
@@ -793,22 +817,24 @@ app.post('/session/:id/generate', async (req: Request, res: Response) => {
     return void res.status(400).json({ error: `Invalid state: ${session.state}` });
 
   const { amounts = {} } = req.body || {};
-  const {
-    igst = 0, cgst = 0, sgst = 0, cess = 0,
-    interest = 0, penalty = 0, fee = 0,
-  } = amounts as Record<string, number>;
+  const a = amounts as Record<string, unknown>;
+  const igst = toHead(a.igst);
+  const cgst = toHead(a.cgst);
+  const sgst = toHead(a.sgst);
+  const cess = toHead(a.cess);
   const payMode = 'UPI'; // always UPI for this flow
 
-  const total = igst + cgst + sgst + cess + interest + penalty + fee;
+  const headSum = (h: TaxHeadAmounts) => h.tax + h.interest + h.penalty + h.fee + h.other;
+  const total = headSum(igst) + headSum(cgst) + headSum(sgst) + headSum(cess);
   if (total <= 0) return void res.status(400).json({ error: 'Total amount must be > 0' });
 
   session.state = 'generating';
-  addLog(session, `Starting challan: ₹${total} (IGST=${igst} CGST=${cgst} SGST=${sgst} CESS=${cess})`);
+  addLog(session, `Starting challan: ₹${total} (IGST=${igst.tax} CGST=${cgst.tax} SGST=${sgst.tax} CESS=${cess.tax})`);
 
   // Accept immediately; run in background
   res.status(202).json({ ok: true, message: 'Generation started — poll GET /session/:id/status' });
 
-  runChallanFlow(session, { igst, cgst, sgst, cess, interest, penalty, fee, payMode })
+  runChallanFlow(session, { igst, cgst, sgst, cess, payMode })
     .catch(err => {
       session.state = 'error';
       session.error = err.message;
