@@ -424,13 +424,54 @@ async function runChallanFlow(
     if (!/^\d{14,18}$/.test(cpin)) throw new Error(`Extracted invalid CPIN: "${cpin}"`);
     addLog(session, `CPIN extracted: ${cpin}`);
 
-    // ── PDF (page snapshot before navigating away) ──────────────
-    addLog(session, 'Saving PDF...');
+    // ── Download official challan PDF via portal DOWNLOAD button ──
+    // The portal has a DOWNLOAD button that serves the real PMT-06 PDF.
+    // We click it and capture the file via Playwright's download event.
+    // Fallback: page.pdf() (page printout) if the button isn't found.
+    addLog(session, 'Downloading official challan PDF...');
     let pdfBase64: string | undefined;
     try {
-      const pdfBuf = await page.pdf({ printBackground: true, format: 'A4' });
-      pdfBase64 = pdfBuf.toString('base64');
-    } catch {}
+      const dlSelectors = [
+        'button[title="Download"]',
+        'a[title="Download"]',
+        'button[ng-click*="download" i]',
+        'button[data-ng-click*="download" i]',
+        'a[ng-click*="download" i]',
+        'button:has-text("DOWNLOAD")',
+        'a:has-text("DOWNLOAD")',
+      ];
+      // Find the first visible DOWNLOAD button/link
+      let dlEl: ReturnType<typeof page.locator> | null = null;
+      for (const sel of dlSelectors) {
+        try {
+          const loc = page.locator(sel).first();
+          if (await loc.isVisible({ timeout: 1500 })) { dlEl = loc; break; }
+        } catch {}
+      }
+      if (dlEl) {
+        const [download] = await Promise.all([
+          page.waitForEvent('download', { timeout: 20000 }),
+          dlEl.click({ timeout: 5000 }),
+        ]);
+        const dlPath = await download.path();
+        if (dlPath) {
+          const pdfBuf = fs.readFileSync(dlPath);
+          pdfBase64 = pdfBuf.toString('base64');
+          addLog(session, `Official challan PDF downloaded ✅ (${Math.round(pdfBuf.length / 1024)} KB)`);
+        } else {
+          throw new Error('Download path was null');
+        }
+      } else {
+        throw new Error('DOWNLOAD button not found on challan page');
+      }
+    } catch (dlErr: any) {
+      addLog(session, `PDF via DOWNLOAD button failed (${dlErr.message}) — falling back to page print`);
+      try {
+        const pdfBuf = await page.pdf({ printBackground: true, format: 'A4' });
+        pdfBase64 = pdfBuf.toString('base64');
+        addLog(session, 'Page-print PDF generated (fallback)');
+      } catch {}
+    }
 
     // ── Select payment sub-mode ─────────────────────────────────
     const isUPI = payMode.toUpperCase() === 'UPI';
@@ -630,6 +671,7 @@ app.post('/session/start', async (req: Request, res: Response) => {
       timezoneId:          'Asia/Kolkata',
       viewport:            { width: 1366, height: 768 },
       ignoreHTTPSErrors:   true,
+      acceptDownloads:     true,
       extraHTTPHeaders:    { 'Accept-Language': 'en-IN,en-US;q=0.9,en;q=0.8' },
     });
     await context.addInitScript(STEALTH_SCRIPT);
