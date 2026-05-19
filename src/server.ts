@@ -183,13 +183,29 @@ async function extractCaptcha(page: Page): Promise<string> {
   for (const sel of sels) {
     try {
       const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 1000 })) {
+      if (await el.isVisible({ timeout: 2000 })) {
+        // Wait for the image to actually finish loading (naturalWidth > 0)
+        // before screenshotting — otherwise we capture a blank placeholder
+        try {
+          await page.waitForFunction(
+            (s: string) => {
+              const img = document.querySelector(s) as HTMLImageElement | null;
+              return img !== null && img.complete && img.naturalWidth > 0;
+            },
+            sel,
+            { timeout: 6000 },
+          );
+        } catch {
+          // If the wait times out, fall through and screenshot anyway —
+          // better to show a partially-loaded image than nothing
+          await sleep(500);
+        }
         const buf = await el.screenshot({ type: 'png' });
         return `data:image/png;base64,${buf.toString('base64')}`;
       }
     } catch {}
   }
-  // Fallback: screenshot the whole viewport (cropped top area where CAPTCHA usually is)
+  // Fallback: screenshot the whole viewport
   const buf = await page.screenshot({ type: 'png', clip: { x: 0, y: 0, width: 1366, height: 768 } });
   return `data:image/png;base64,${buf.toString('base64')}`;
 }
