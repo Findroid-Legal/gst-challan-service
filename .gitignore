@@ -1,0 +1,8 @@
+node_modules/
+dist/
+sessions/          # ← contains your live session cookies — NEVER commit
+output/
+profile/           # persistent Chrome profile — contains login cookies
+profiles/          # per-session profiles created by server.ts
+.env
+*.log
