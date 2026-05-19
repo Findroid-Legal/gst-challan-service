@@ -8,12 +8,13 @@ WORKDIR /app
 COPY package*.json ./
 COPY tsconfig.json ./
 
-# Install Node dependencies
-# Browsers are already at /ms-playwright — no playwright install needed
+# Install all deps (devDeps needed for tsc compile step below)
 RUN npm ci
 
-# Copy source
+# Copy source and compile TypeScript → CommonJS JavaScript
+# This avoids ts-node's ESM incompatibility with modern packages at runtime
 COPY src/ ./src/
+RUN npx tsc
 
 # Runtime directories
 RUN mkdir -p profiles output
@@ -21,4 +22,5 @@ RUN mkdir -p profiles output
 # Railway injects $PORT; default 3001 for local docker run
 EXPOSE 3001
 
-CMD ["npx", "ts-node", "src/server.ts"]
+# Run the compiled JS — no ts-node, no ESM issues
+CMD ["node", "dist/server.js"]
