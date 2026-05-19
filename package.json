@@ -11,14 +11,19 @@
     "scrape:notices": "ts-node src/scrape-notices.ts",
     "scrape:returns": "ts-node src/scrape-returns.ts",
     "scrape:ledger": "ts-node src/scrape-ledger.ts",
-    "session:check": "ts-node src/session-check.ts"
+    "session:check": "ts-node src/session-check.ts",
+    "test:it": "ts-node src/test-it-portal.ts",
+    "explore:it": "ts-node src/it-explore.ts",
+    "test:it-flow": "ts-node src/test-it-flow.ts"
   },
   "dependencies": {
     "axios": "^1.7.9",
     "chalk": "^4.1.2",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
-    "playwright": "1.60.0"
+    "playwright": "1.60.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
