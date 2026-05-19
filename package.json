@@ -4,7 +4,7 @@
   "description": "Local GST portal scraper - test bed before app integration",
   "scripts": {
     "server": "ts-node src/server.ts",
-    "start": "ts-node src/run.ts",
+    "start": "node dist/server.js",
     "challan": "ts-node src/create-challan.ts",
     "login": "ts-node src/login.ts",
     "explore": "ts-node src/explore.ts",
