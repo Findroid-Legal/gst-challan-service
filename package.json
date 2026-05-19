@@ -14,7 +14,8 @@
     "session:check": "ts-node src/session-check.ts",
     "test:it": "ts-node src/test-it-portal.ts",
     "explore:it": "ts-node src/it-explore.ts",
-    "test:it-flow": "ts-node src/test-it-flow.ts"
+    "test:it-flow": "ts-node src/test-it-flow.ts",
+    "build": "tsc"
   },
   "dependencies": {
     "axios": "^1.7.9",
