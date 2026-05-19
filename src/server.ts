@@ -1177,10 +1177,13 @@ app.post('/it/session/:id/download', async (req: Request, res: Response) => {
   // Run downloads async
   (async () => {
     try {
-      // Make sure we're on the returns page
-      if (!s.page.url().includes('itrStatus')) {
-        await navigateToFiledReturns(s);
-      }
+      // Always navigate fresh to the returns page before downloading.
+      // On Railway headless the page can drift (dialogs, session expiry)
+      // so we never rely on the current URL.
+      itLog(s, 'Navigating to View Filed Returns before download');
+      await navigateToFiledReturns(s);
+      // Extra settle time after navigation
+      await s.page.waitForTimeout(1500);
 
       for (const item of newItems) {
         item.state = 'downloading';
@@ -1191,21 +1194,26 @@ app.post('/it/session/:id/download', async (req: Request, res: Response) => {
           if (item.type === 'json')       btn = s.page.getByRole('button', { name: 'Download JSON' }).nth(item.ayIndex);
           if (item.type === 'intimation') btn = s.page.getByRole('link', { name: /Download Intimation Order/i }).nth(item.ayIndex);
 
+          // Wait for button to be visible and stable before clicking
+          await btn.waitFor({ state: 'visible', timeout: 15000 });
           await btn.scrollIntoViewIfNeeded();
+          await s.page.waitForTimeout(500);
+
+          itLog(s, `Clicking ${item.type} button at index ${item.ayIndex}`);
           const [dl] = await Promise.all([
-            s.page.waitForEvent('download', { timeout: 60000 }),
+            s.page.waitForEvent('download', { timeout: 90000 }),
             btn.click(),
           ]);
           item.base64 = await downloadToBase64(dl);
           item.filename = dl.suggestedFilename() || `${item.type}-${item.ay}.pdf`;
           item.state = 'done';
-          itLog(s, `Done: ${item.type} for ${item.ay}`);
+          itLog(s, `Done: ${item.type} for ${item.ay} — ${item.filename}`);
         } catch (e: any) {
           item.state = 'error';
           item.error = e.message;
-          itLog(s, `Error: ${item.type}: ${e.message}`);
+          itLog(s, `Error downloading ${item.type}: ${e.message}`);
         }
-        await s.page.waitForTimeout(500);
+        await s.page.waitForTimeout(800);
       }
       s.state = 'ready';
     } catch (e: any) {
@@ -1227,13 +1235,17 @@ app.post('/it/session/:id/download-form', async (req: Request, res: Response) =>
 
   (async () => {
     try {
-      if (!s.page.url().includes('itrStatus')) await navigateToFiledReturns(s);
+      itLog(s, `Navigating to View Filed Returns for form download`);
+      await navigateToFiledReturns(s);
+      await s.page.waitForTimeout(1500);
       item.state = 'downloading';
       itLog(s, `Downloading form for ${ay} (slow, index ${ayIndex})`);
       const btn = s.page.getByRole('button', { name: 'Download Form' }).nth(ayIndex);
+      await btn.waitFor({ state: 'visible', timeout: 15000 });
       await btn.scrollIntoViewIfNeeded();
+      await s.page.waitForTimeout(500);
       const [dl] = await Promise.all([
-        s.page.waitForEvent('download', { timeout: 60000 }),
+        s.page.waitForEvent('download', { timeout: 120000 }),
         btn.click(),
       ]);
       item.base64 = await downloadToBase64(dl);
