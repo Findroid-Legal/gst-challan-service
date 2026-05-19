@@ -271,20 +271,38 @@ async function runChallanFlow(
     });
     await page.goto('https://return.gst.gov.in/returns/auth/dashboard',
       { waitUntil: 'load', timeout: 30000 });
-    await sleep(4000);
+    {
+      const bodySnippet = (await page.locator('body').textContent().catch(() => '')).toLowerCase().slice(0, 2000);
+      if (bodySnippet.includes('under maintenance') || bodySnippet.includes('temporarily unavailable') || bodySnippet.includes('scheduled maintenance')) {
+        throw new Error('GST Portal is under maintenance. Please try again later.');
+      }
+    }
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
     await page.setExtraHTTPHeaders({});
 
     // ── Cashledger ──────────────────────────────────────────────
     addLog(session, 'Navigating to cashledger...');
     await page.goto('https://payment.gst.gov.in/payment/auth/ledger/cashledger',
       { waitUntil: 'load', timeout: 30000 });
-    await sleep(3000);
+    {
+      const bodySnippet = (await page.locator('body').textContent().catch(() => '')).toLowerCase().slice(0, 2000);
+      if (bodySnippet.includes('under maintenance') || bodySnippet.includes('temporarily unavailable') || bodySnippet.includes('scheduled maintenance')) {
+        throw new Error('GST Portal is under maintenance. Please try again later.');
+      }
+    }
+    await page.waitForSelector('[ng-controller],[data-ng-controller]', { timeout: 6000 }).catch(() => {});
     if (!page.url().includes('payment.gst.gov.in')) {
       addLog(session, 'Retrying cashledger with Referer...');
       await page.setExtraHTTPHeaders({ 'Referer': 'https://return.gst.gov.in/returns/auth/dashboard' });
       await page.goto('https://payment.gst.gov.in/payment/auth/ledger/cashledger',
         { waitUntil: 'load', timeout: 30000 });
-      await sleep(3000);
+      {
+        const bodySnippet = (await page.locator('body').textContent().catch(() => '')).toLowerCase().slice(0, 2000);
+        if (bodySnippet.includes('under maintenance') || bodySnippet.includes('temporarily unavailable') || bodySnippet.includes('scheduled maintenance')) {
+          throw new Error('GST Portal is under maintenance. Please try again later.');
+        }
+      }
+      await page.waitForSelector('[ng-controller],[data-ng-controller]', { timeout: 6000 }).catch(() => {});
       await page.setExtraHTTPHeaders({});
     }
     if (!page.url().includes('payment.gst.gov.in'))
@@ -296,13 +314,18 @@ async function runChallanFlow(
       (window as any).location.href = 'https://payment.gst.gov.in/payment/auth/';
     });
     try { await page.waitForNavigation({ waitUntil: 'load', timeout: 20000 }); } catch {}
-    await sleep(5000);
+    {
+      const bodySnippet = (await page.locator('body').textContent().catch(() => '')).toLowerCase().slice(0, 2000);
+      if (bodySnippet.includes('under maintenance') || bodySnippet.includes('temporarily unavailable') || bodySnippet.includes('scheduled maintenance')) {
+        throw new Error('GST Portal is under maintenance. Please try again later.');
+      }
+    }
+    await page.waitForSelector('#aop, input[value="aop"], [ng-controller]', { timeout: 12000 }).catch(() => {});
 
     // ── Select AOP radio ────────────────────────────────────────
     addLog(session, 'Selecting AOP...');
     try { await page.locator('#aop').click({ timeout: 3000 }); } catch {}
     await angularClick(page, 'aop');
-    await sleep(1000);
 
     // ── Wait for + click PROCEED ────────────────────────────────
     addLog(session, 'Clicking PROCEED...');
@@ -328,7 +351,7 @@ async function runChallanFlow(
         if (btn) { btn.removeAttribute('disabled'); btn.disabled = false; btn.click(); }
       });
     }
-    await sleep(4000);
+    await page.waitForSelector('input[name*="tax_amt"], input[data-ng-model*="challanData"], input[name*="igst"]', { timeout: 12000 }).catch(() => {});
 
     // ── Fill amounts ────────────────────────────────────────────
     addLog(session, `Filling: IGST=${igst} CGST=${cgst} SGST=${sgst} CESS=${cess}`);
@@ -346,7 +369,6 @@ async function runChallanFlow(
         } catch {}
       }
     }
-    await sleep(500);
 
     // ── E-Payment ───────────────────────────────────────────────
     addLog(session, 'Selecting E-Payment...');
@@ -358,7 +380,7 @@ async function runChallanFlow(
         }
       } catch {}
     }
-    await sleep(2000);
+    await page.waitForSelector('#forEpay, button[ng-click*="generatechallan"]', { timeout: 6000 }).catch(() => {});
 
     // ── Generate Challan ────────────────────────────────────────
     addLog(session, 'Generating challan...');
@@ -380,16 +402,27 @@ async function runChallanFlow(
         } else btn.click();
       });
     }
-    await sleep(5000);
+    addLog(session, 'Waiting for CPIN to appear...');
+    await page.waitForFunction(
+      () => /CPIN[^\d]*\d{14,18}/i.test(document.body.textContent || '') || /\b2\d{13}\b/.test(document.body.textContent || ''),
+      { timeout: 30000, polling: 500 }
+    ).catch(() => {});
 
     // ── Extract CPIN ────────────────────────────────────────────
     addLog(session, 'Extracting CPIN...');
     const bodyText = await page.locator('body').textContent() as string;
-    const cpinM = bodyText.match(/(?:CPIN|cpin)[^\d]*(\d{14,18})/i)
+    // CPIN is always 14 digits starting with current year (e.g. 26050700238514)
+    // Primary: look for CPIN label then digits
+    // Secondary: any 14-digit number starting with 2 (year 2024+)
+    // Tertiary: any 14-18 digit sequence
+    const cpinM = bodyText.match(/CPIN[^\d]*(\d{14,18})/i)
+               || bodyText.match(/challan\s+(?:reference|no\.?|number)[^\d]*(\d{14,18})/i)
+               || bodyText.match(/\b(2\d{13})\b/)
                || bodyText.match(/\b(\d{14,18})\b/);
-    if (!cpinM) throw new Error('CPIN not found');
-    const cpin = cpinM[1] || cpinM[0].replace(/\D/g, '');
-    addLog(session, `CPIN: ${cpin}`);
+    if (!cpinM) throw new Error('CPIN not found on page after challan generation');
+    const cpin = cpinM[1] ?? cpinM[0].replace(/\D/g, '');
+    if (!/^\d{14,18}$/.test(cpin)) throw new Error(`Extracted invalid CPIN: "${cpin}"`);
+    addLog(session, `CPIN extracted: ${cpin}`);
 
     // ── PDF (page snapshot before navigating away) ──────────────
     addLog(session, 'Saving PDF...');
@@ -420,7 +453,7 @@ async function runChallanFlow(
     if (!payTabClicked) {
       await callAngularFn(page, isUPI ? 'UPI' : 'NB');
     }
-    await sleep(3000);
+    await page.waitForSelector('input[type="radio"]:not(#checkbox-consent)', { timeout: 8000 }).catch(() => {});
 
     // ── Select first available bank ─────────────────────────────
     addLog(session, 'Finding first available bank...');
@@ -452,27 +485,23 @@ async function runChallanFlow(
         addLog(session, 'Consent checked');
       }
     } catch {}
-    await sleep(1000);
 
     // ── Intercept bank form POST before Make Payment ───────────────────────────
     // Banks create a session tied to the browser that sends the initial POST.
     // We capture the POST fields here and abort the headless browser's navigation
     // so the user's own browser can make the POST directly (creating a fresh
     // session that works in their browser instead of our headless one).
-    const BANK_PATTERNS = [
-      'axisbank', 'hdfcbank', 'sbi.co', 'icicibank', 'pnbindia',
-      'unionbank', 'canarabank', 'bankofbaroda', 'easypay', 'billdesk',
-      'paytm', 'npci', 'razorpay', 'instamojo', 'kotakbank',
-    ];
     interface BankCapture { url: string; method: string; fields: Record<string, string> }
     let bankFormCapture: BankCapture | null = null;
 
     await page.route('**', async (route) => {
       const req = route.request();
       const url = req.url();
-      const isBankUrl = BANK_PATTERNS.some(p => url.toLowerCase().includes(p))
-                     && !url.includes('gst.gov.in');
-      if (isBankUrl && !bankFormCapture) {
+      // Intercept the first navigation to any non-GST domain after Make Payment —
+      // this is the bank payment gateway regardless of which bank/aggregator is used.
+      const isGST = url.includes('gst.gov.in');
+      const isResource = ['image','stylesheet','font','media','other'].includes(req.resourceType());
+      if (!isGST && !isResource && !bankFormCapture) {
         const postData = req.postData();
         const fields: Record<string, string> = {};
         if (postData) {
@@ -480,7 +509,7 @@ async function runChallanFlow(
         }
         bankFormCapture = { url, method: req.method(), fields };
         addLog(session, `Bank redirect captured: ${url.substring(0, 80)}`);
-        await route.abort();   // prevent headless browser from consuming the session
+        await route.abort();
       } else {
         await route.continue();
       }
@@ -488,14 +517,13 @@ async function runChallanFlow(
 
     // ── Wait for Make Payment to enable ─────────────────────────
     addLog(session, 'Waiting for Make Payment to enable...');
-    for (let i = 0; i < 10; i++) {
-      await sleep(1000);
-      const ready = await page.evaluate(() => {
-        const btn = document.querySelector<HTMLButtonElement>('button[title="Make Payment"]');
-        return btn && !btn.disabled && btn.getAttribute('disabled') === null;
-      });
-      if (ready) break;
-    }
+    await page.waitForFunction(
+      () => {
+        const btn = document.querySelector('button[title="Make Payment"]') as HTMLButtonElement | null;
+        return btn !== null && !btn.disabled && btn.getAttribute('disabled') === null;
+      },
+      { timeout: 15000, polling: 300 }
+    ).catch(() => {});
 
     // ── Click Make Payment ──────────────────────────────────────
     addLog(session, 'Clicking Make Payment...');
@@ -522,8 +550,10 @@ async function runChallanFlow(
 
     // ── Wait for bank intercept or gateway URL ──────────────────
     addLog(session, 'Waiting for bank payment form...');
-    // Give up to 10 s for the bank route to fire or page to redirect
-    for (let i = 0; i < 10 && !bankFormCapture; i++) await sleep(1000);
+    await new Promise<void>(resolve => {
+      const t = setTimeout(resolve, 10000);
+      const iv = setInterval(() => { if (bankFormCapture) { clearInterval(iv); clearTimeout(t); resolve(); } }, 200);
+    });
     await page.unrouteAll();
 
     const gatewayUrl = bankFormCapture?.url ?? page.url();
@@ -623,7 +653,15 @@ app.post('/session/start', async (req: Request, res: Response) => {
     addLog(session, 'Loading GST login page...');
     await page.goto('https://services.gst.gov.in/services/login',
       { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await sleep(2000);
+    await page.waitForSelector('#username, input[name="username"]', { timeout: 15000 });
+    const loginTitle = await page.title().catch(() => '');
+    const loginBody = (await page.locator('body').textContent().catch(() => '')).toLowerCase();
+    if (loginBody.includes('under maintenance') || loginBody.includes('temporarily unavailable')) {
+      throw new Error('GST Portal is under maintenance. Please try again later.');
+    }
+    if (!await page.locator('#username, input[name="username"]').isVisible({ timeout: 3000 }).catch(() => false)) {
+      throw new Error(`GST login page did not load correctly (title: "${loginTitle}"). Portal may be down.`);
+    }
 
     // Fill username
     for (const sel of ['#username', 'input[name="username"]', 'input[type="text"]:first-of-type']) {
