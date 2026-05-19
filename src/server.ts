@@ -438,6 +438,38 @@ async function runChallanFlow(
     } catch {}
     await sleep(1000);
 
+    // ── Intercept bank form POST before Make Payment ───────────────────────────
+    // Banks create a session tied to the browser that sends the initial POST.
+    // We capture the POST fields here and abort the headless browser's navigation
+    // so the user's own browser can make the POST directly (creating a fresh
+    // session that works in their browser instead of our headless one).
+    const BANK_PATTERNS = [
+      'axisbank', 'hdfcbank', 'sbi.co', 'icicibank', 'pnbindia',
+      'unionbank', 'canarabank', 'bankofbaroda', 'easypay', 'billdesk',
+      'paytm', 'npci', 'razorpay', 'instamojo', 'kotakbank',
+    ];
+    interface BankCapture { url: string; method: string; fields: Record<string, string> }
+    let bankFormCapture: BankCapture | null = null;
+
+    await page.route('**', async (route) => {
+      const req = route.request();
+      const url = req.url();
+      const isBankUrl = BANK_PATTERNS.some(p => url.toLowerCase().includes(p))
+                     && !url.includes('gst.gov.in');
+      if (isBankUrl && !bankFormCapture) {
+        const postData = req.postData();
+        const fields: Record<string, string> = {};
+        if (postData) {
+          try { new URLSearchParams(postData).forEach((v, k) => { fields[k] = v; }); } catch {}
+        }
+        bankFormCapture = { url, method: req.method(), fields };
+        addLog(session, `Bank redirect captured: ${url.substring(0, 80)}`);
+        await route.abort();   // prevent headless browser from consuming the session
+      } else {
+        await route.continue();
+      }
+    });
+
     // ── Wait for Make Payment to enable ─────────────────────────
     addLog(session, 'Waiting for Make Payment to enable...');
     for (let i = 0; i < 10; i++) {
@@ -472,11 +504,18 @@ async function runChallanFlow(
       }
     }
 
-    // ── Wait for payment gateway redirect ───────────────────────
-    addLog(session, 'Waiting for payment gateway URL...');
-    await sleep(8000);
-    const gatewayUrl = page.url();
-    addLog(session, `Gateway URL: ${gatewayUrl}`);
+    // ── Wait for bank intercept or gateway URL ──────────────────
+    addLog(session, 'Waiting for bank payment form...');
+    // Give up to 10 s for the bank route to fire or page to redirect
+    for (let i = 0; i < 10 && !bankFormCapture; i++) await sleep(1000);
+    await page.unrouteAll();
+
+    const gatewayUrl = bankFormCapture?.url ?? page.url();
+    if (bankFormCapture) {
+      addLog(session, `Bank form captured (${Object.keys(bankFormCapture.fields).length} fields)`);
+    } else {
+      addLog(session, `Gateway URL: ${gatewayUrl}`);
+    }
 
     // ── Store result ────────────────────────────────────────────
     session.result = {
@@ -487,6 +526,13 @@ async function runChallanFlow(
       bank: selectedBank,
       payMode,
       ts: new Date().toISOString(),
+      ...(bankFormCapture ? {
+        bankForm: {
+          action: bankFormCapture.url,
+          method: bankFormCapture.method,
+          fields: bankFormCapture.fields,
+        },
+      } : {}),
     };
     session.state = 'done';
     addLog(session, `✅ Done! CPIN=${cpin}`);
