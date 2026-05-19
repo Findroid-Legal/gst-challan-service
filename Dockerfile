@@ -1,6 +1,6 @@
 # ── GST Challan Microservice ──────────────────────────────────────────────────
 # Uses official Playwright image — Chromium + all system deps pre-installed
-FROM mcr.microsoft.com/playwright:v1.49.0-jammy
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy
 
 WORKDIR /app
 
