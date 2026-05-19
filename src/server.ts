@@ -20,7 +20,7 @@
  */
 
 import express, { Request, Response, NextFunction } from 'express';
-import { v4 as uuidv4 } from 'uuid';
+import { randomUUID } from 'crypto';
 import { chromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
 import fs from 'fs';
@@ -524,7 +524,7 @@ app.post('/session/start', async (req: Request, res: Response) => {
   if (!username || !password)
     return void res.status(400).json({ error: 'username and password required' });
 
-  const id = uuidv4();
+  const id = randomUUID();
   const profileDir = path.join(PROFILES_DIR, id);
   fs.mkdirSync(profileDir, { recursive: true });
 
