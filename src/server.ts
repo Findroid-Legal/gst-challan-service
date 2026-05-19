@@ -517,9 +517,9 @@ app.get('/health', (_req, res) => {
   res.json({ ok: true, sessions: sessions.size, ts: new Date().toISOString() });
 });
 
-// ── POST /api/challan/start ───────────────────────────────────────────────────
+// ── POST /session/start ───────────────────────────────────────────────────────
 // Start headless browser, fill credentials, return CAPTCHA image
-app.post('/api/challan/start', async (req: Request, res: Response) => {
+app.post('/session/start', async (req: Request, res: Response) => {
   const { username, password } = req.body || {};
   if (!username || !password)
     return void res.status(400).json({ error: 'username and password required' });
@@ -594,23 +594,24 @@ app.post('/api/challan/start', async (req: Request, res: Response) => {
   }
 });
 
-// ── POST /api/challan/:id/login ───────────────────────────────────────────────
+// ── POST /session/:id/login ───────────────────────────────────────────────────
 // Submit CAPTCHA text → complete login
-app.post('/api/challan/:id/login', async (req: Request, res: Response) => {
+// Always returns HTTP 200; wrong CAPTCHA → { ok: false, captchaImage, error }
+app.post('/session/:id/login', async (req: Request, res: Response) => {
   const session = sessions.get(String(req.params.id));
   if (!session)              return void res.status(404).json({ error: 'Session not found' });
   if (session.state !== 'captcha_pending')
     return void res.status(400).json({ error: `Invalid state: ${session.state}` });
 
-  const { captchaText } = req.body || {};
-  if (!captchaText) return void res.status(400).json({ error: 'captchaText required' });
+  const { captcha } = req.body || {};
+  if (!captcha) return void res.status(400).json({ error: 'captcha required' });
 
   session.state = 'logging_in';
-  addLog(session, `Submitting CAPTCHA: "${captchaText}"`);
+  addLog(session, `Submitting CAPTCHA: "${captcha}"`);
 
   try {
     const { page } = session;
-    await fillCaptchaAndLogin(page, captchaText);
+    await fillCaptchaAndLogin(page, captcha);
 
     // Wait up to 30s for navigation away from login
     const deadline = Date.now() + 30000;
@@ -620,11 +621,11 @@ app.post('/api/challan/:id/login', async (req: Request, res: Response) => {
     }
 
     if (page.url().includes('/services/login')) {
-      // Still on login — wrong CAPTCHA, get a new one
+      // Still on login — wrong CAPTCHA; return HTTP 200 with ok:false + fresh image
       session.state = 'captcha_pending';
       addLog(session, 'Login failed (wrong CAPTCHA?) — refreshing CAPTCHA');
       const captchaImage = await extractCaptcha(page);
-      return void res.status(400).json({ error: 'Login failed — wrong CAPTCHA. Try again.', captchaImage });
+      return void res.json({ ok: false, error: 'Wrong CAPTCHA — try again.', captchaImage });
     }
 
     await sleep(2000);
@@ -640,19 +641,21 @@ app.post('/api/challan/:id/login', async (req: Request, res: Response) => {
   }
 });
 
-// ── POST /api/challan/:id/generate ────────────────────────────────────────────
-// Start challan generation (async — poll /status)
-app.post('/api/challan/:id/generate', async (req: Request, res: Response) => {
+// ── POST /session/:id/generate ────────────────────────────────────────────────
+// Start challan generation async — returns 202; poll /session/:id/status
+// Body: { amounts: { igst, cgst, sgst, cess, interest, penalty, fee } }
+app.post('/session/:id/generate', async (req: Request, res: Response) => {
   const session = sessions.get(String(req.params.id));
   if (!session)           return void res.status(404).json({ error: 'Session not found' });
   if (session.state !== 'ready')
     return void res.status(400).json({ error: `Invalid state: ${session.state}` });
 
+  const { amounts = {} } = req.body || {};
   const {
     igst = 0, cgst = 0, sgst = 0, cess = 0,
     interest = 0, penalty = 0, fee = 0,
-    payMode = 'UPI',
-  } = req.body || {};
+  } = amounts as Record<string, number>;
+  const payMode = 'UPI'; // always UPI for this flow
 
   const total = igst + cgst + sgst + cess + interest + penalty + fee;
   if (total <= 0) return void res.status(400).json({ error: 'Total amount must be > 0' });
@@ -660,10 +663,9 @@ app.post('/api/challan/:id/generate', async (req: Request, res: Response) => {
   session.state = 'generating';
   addLog(session, `Starting challan: ₹${total} (IGST=${igst} CGST=${cgst} SGST=${sgst} CESS=${cess})`);
 
-  // Accept request immediately, run flow in background
-  res.status(202).json({ ok: true, message: 'Challan generation started. Poll GET /api/challan/:id/status' });
+  // Accept immediately; run in background
+  res.status(202).json({ ok: true, message: 'Generation started — poll GET /session/:id/status' });
 
-  // Fire and forget — errors stored in session
   runChallanFlow(session, { igst, cgst, sgst, cess, interest, penalty, fee, payMode })
     .catch(err => {
       session.state = 'error';
@@ -672,27 +674,35 @@ app.post('/api/challan/:id/generate', async (req: Request, res: Response) => {
     });
 });
 
-// ── GET /api/challan/:id/status ───────────────────────────────────────────────
-// Poll this after /generate — returns state, logs, and result when done
-app.get('/api/challan/:id/status', (req: Request, res: Response) => {
+// ── GET /session/:id/status ───────────────────────────────────────────────────
+// Poll after /generate — returns simplified state + live logs + final result
+app.get('/session/:id/status', (req: Request, res: Response) => {
   const session = sessions.get(String(req.params.id));
   if (!session) return void res.status(404).json({ error: 'Session not found' });
 
+  // Map internal state → simplified API state
+  const stateMap: Record<string, string> = {
+    captcha_pending: 'pending',
+    logging_in:      'pending',
+    ready:           'pending',
+    generating:      'generating',
+    done:            'done',
+    error:           'error',
+  };
+
   res.json({
-    state:  session.state,
-    logs:   session.logs.slice(-30),       // last 30 lines
+    state:  stateMap[session.state] ?? 'pending',
+    logs:   session.logs.slice(-30),
     result: session.result,
     error:  session.error,
   });
 });
 
-// ── GET /api/challan/:id/captcha/refresh ──────────────────────────────────────
-// Get a fresh CAPTCHA image (portal auto-refreshes after failed login)
-app.get('/api/challan/:id/captcha/refresh', async (req: Request, res: Response) => {
+// ── POST /session/:id/captcha/refresh ────────────────────────────────────────
+// Get a fresh CAPTCHA screenshot from the headless browser
+app.post('/session/:id/captcha/refresh', async (req: Request, res: Response) => {
   const session = sessions.get(String(req.params.id));
   if (!session) return void res.status(404).json({ error: 'Session not found' });
-  if (session.state !== 'captcha_pending')
-    return void res.status(400).json({ error: 'Only valid in captcha_pending state' });
 
   try {
     const captchaImage = await extractCaptcha(session.page);
@@ -702,19 +712,19 @@ app.get('/api/challan/:id/captcha/refresh', async (req: Request, res: Response) 
   }
 });
 
-// ── DELETE /api/challan/:id ───────────────────────────────────────────────────
-// Explicitly close a session
-app.delete('/api/challan/:id', (req: Request, res: Response) => {
+// ── POST /session/:id/close ───────────────────────────────────────────────────
+// Explicitly close a session and free its browser process + profile dir
+app.post('/session/:id/close', (req: Request, res: Response) => {
   const session = sessions.get(String(req.params.id));
   if (!session) return void res.status(404).json({ error: 'Session not found' });
   cleanupSession(session);
   res.json({ ok: true });
 });
 
-// ── GET /api/challan/payment-status/:cpin ────────────────────────────────────
+// ── GET /payment/:cpin/status ─────────────────────────────────────────────────
 // Check if payment for a CPIN has been received
-// Uses the GST portal's track payment API (unauthenticated public endpoint)
-app.get('/api/challan/payment-status/:cpin', async (req: Request, res: Response) => {
+// Uses the GST portal's public track-payment API (no auth required)
+app.get('/payment/:cpin/status', async (req: Request, res: Response) => {
   const cpin = String(req.params.cpin);
   if (!cpin.match(/^\d{14,18}$/))
     return void res.status(400).json({ error: 'Invalid CPIN format' });
