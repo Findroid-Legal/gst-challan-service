@@ -810,9 +810,32 @@ app.post('/session/:id/login', async (req: Request, res: Response) => {
     }
 
     if (page.url().includes('/services/login')) {
-      // Still on login — wrong CAPTCHA; return HTTP 200 with ok:false + fresh image
+      // Still on login — read the page to distinguish wrong-password from wrong-CAPTCHA
+      const bodyText = (await page.locator('body').textContent().catch(() => '')).toLowerCase();
+
+      const isCredentialError =
+        bodyText.includes('invalid username or password') ||
+        bodyText.includes('invalid credentials') ||
+        bodyText.includes('account is locked') ||
+        bodyText.includes('account has been locked') ||
+        bodyText.includes('user is locked') ||
+        bodyText.includes('incorrect username');
+
+      if (isCredentialError) {
+        // Wrong password / locked account — fatal, can't retry with just a new CAPTCHA
+        session.state = 'error';
+        session.error = 'Invalid username or password';
+        addLog(session, 'Login failed: invalid username or password');
+        return void res.json({
+          ok: false,
+          error: 'Invalid username or password. Please check your GST portal credentials.',
+          fatalError: true,   // signals frontend to go back to form, not loop on CAPTCHA
+        });
+      }
+
+      // Otherwise assume wrong CAPTCHA — refresh image and let user retry
       session.state = 'captcha_pending';
-      addLog(session, 'Login failed (wrong CAPTCHA?) — refreshing CAPTCHA');
+      addLog(session, 'Login failed: wrong CAPTCHA — refreshing image');
       const captchaImage = await extractCaptcha(page);
       return void res.json({ ok: false, error: 'Wrong CAPTCHA — try again.', captchaImage });
     }
