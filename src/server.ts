@@ -238,6 +238,10 @@ async function extractCaptcha(page: Page): Promise<string> {
 }
 
 // ── Fill CAPTCHA input and submit login ───────────────────────────────────────
+// IMPORTANT: must use pressSequentially (character-by-character keystrokes)
+// NOT el.fill() — fill() sets value via DOM property bypass, so AngularJS
+// ng-model never sees the keydown/input events and the model stays empty.
+// The portal then validates an empty string → always "Wrong CAPTCHA".
 async function fillCaptchaAndLogin(page: Page, text: string): Promise<void> {
   const inputSels = [
     '#userCaptcha', '#captcha', '#captchaText',
@@ -251,14 +255,30 @@ async function fillCaptchaAndLogin(page: Page, text: string): Promise<void> {
     try {
       const el = page.locator(sel).first();
       if (await el.isVisible({ timeout: 800 })) {
+        // Select all existing content then replace with keystrokes so Angular sees each keystroke
         await el.click({ clickCount: 3 });
-        await el.fill(text);
+        await el.press('Control+a');
+        await el.press('Delete');
+        await el.pressSequentially(text, { delay: 40 }); // simulates real typing
+        // Force Angular digest so ng-model syncs before we click LOGIN
+        await page.evaluate(() => {
+          try {
+            const root = (window as any).angular
+              ?.element(document.body)
+              ?.injector?.()
+              ?.get?.('$rootScope');
+            if (root && !root.$$phase) root.$apply();
+          } catch {}
+        });
         filled = true;
         break;
       }
     } catch {}
   }
   if (!filled) throw new Error('CAPTCHA input field not found');
+
+  // Small pause to let Angular finish any pending watchers before LOGIN click
+  await sleep(300);
 
   // Click login button
   const btnSels = [
