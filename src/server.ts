@@ -45,6 +45,7 @@ type SessionState =
   | 'ready'             // Logged in, ready to generate
   | 'generating'        // Challan flow running
   | 'done'              // Challan + gateway URL ready
+  | 'downloading_2b'    // GSTR-2B JSON download in progress
   | 'error';            // Something went wrong
 
 interface ChallanResult {
@@ -57,6 +58,15 @@ interface ChallanResult {
   ts:          string;
 }
 
+interface GSTR2BDownloadItem {
+  period:      string;       // MMYYYY
+  state:       'pending' | 'downloading' | 'done' | 'error';
+  jsonBase64?: string;
+  filename?:   string;
+  size?:       number;
+  error?:      string;
+}
+
 interface Session {
   id:          string;
   context:     BrowserContext;
@@ -67,6 +77,8 @@ interface Session {
   error?:      string;
   createdAt:   number;
   profileDir:  string;
+  // GSTR-2B bulk download tracking
+  gstr2bDownloads?: GSTR2BDownloadItem[];
 }
 
 const sessions = new Map<string, Session>();
@@ -679,6 +691,317 @@ async function runChallanFlow(
   // Keep context open so app can close it explicitly (or TTL cleanup)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GSTR-2B JSON DOWNLOAD — Portal automation
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Map MMYYYY period string to text labels used in the GST portal dropdowns.
+ * Portal uses AngularJS ng-options with object:NNN values, so we match by
+ * visible label text instead.
+ */
+function periodToPortalLabels(period: string) {
+  const mm = parseInt(period.slice(0, 2), 10);
+  const yyyy = parseInt(period.slice(2), 10);
+
+  // Financial year: April = start of FY
+  const fyStart = mm >= 4 ? yyyy : yyyy - 1;
+  const fyEnd = fyStart + 1;
+  // Portal may show "2025-2026" or "2025-26"
+  const fySearchTexts = [
+    `${fyStart}-${fyEnd}`,
+    `${fyStart}-${String(fyEnd).slice(-2)}`,
+    `${fyStart}`,
+  ];
+
+  // Quarter: Apr-Jun=Q1, Jul-Sep=Q2, Oct-Dec=Q3, Jan-Mar=Q4
+  const qNum = mm >= 4 ? Math.ceil((mm - 3) / 3) : 4;
+  const qLabels: Record<number, string[]> = {
+    1: ['Apr', 'Q1', 'Quarter 1', 'Apr-Jun', 'April'],
+    2: ['Jul', 'Q2', 'Quarter 2', 'Jul-Sep', 'July'],
+    3: ['Oct', 'Q3', 'Quarter 3', 'Oct-Dec', 'October'],
+    4: ['Jan', 'Q4', 'Quarter 4', 'Jan-Mar', 'January'],
+  };
+  const quarterSearchTexts = qLabels[qNum] || [];
+
+  // Month
+  const monthNames = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  const monthName = monthNames[mm - 1];
+  const monthSearchTexts = [monthName, monthName.slice(0, 3), String(mm).padStart(2, '0')];
+
+  return { fySearchTexts, quarterSearchTexts, monthSearchTexts, monthName, qNum, mm, yyyy };
+}
+
+/**
+ * Select a <select> dropdown option by searching for partial text match
+ * in option labels. Tries each searchText in order, returns true on first match.
+ * Also triggers Angular change events so ng-model updates.
+ */
+async function selectByPartialLabel(
+  page: Page, selector: string, searchTexts: string[],
+): Promise<boolean> {
+  const options = await page.evaluate((sel: string) => {
+    const select = document.querySelector(sel) as HTMLSelectElement | null;
+    if (!select) return [];
+    return Array.from(select.options).map((opt, i) => ({
+      index: i, text: opt.text.trim(), value: opt.value,
+    }));
+  }, selector);
+
+  for (const search of searchTexts) {
+    const match = options.find(o =>
+      o.text.toLowerCase().includes(search.toLowerCase()),
+    );
+    if (match) {
+      await page.locator(selector).selectOption({ index: match.index });
+      // Trigger Angular change event so ng-model picks up the selection
+      await page.evaluate((sel: string) => {
+        const el = document.querySelector(sel) as HTMLSelectElement;
+        if (!el) return;
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        try {
+          const scope = (window as any).angular?.element(el)?.scope?.();
+          if (scope && !scope.$root?.$$phase) scope.$apply();
+        } catch {}
+      }, selector);
+      await sleep(300);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Navigate the headless browser to the GST Returns Dashboard.
+ * Does SSO hop from services.gst.gov.in → return.gst.gov.in.
+ */
+async function navigateToReturnsDashboard(session: Session): Promise<void> {
+  const { page } = session;
+
+  addLog(session, 'Navigating to Returns Dashboard...');
+  await page.setExtraHTTPHeaders({
+    Referer: 'https://services.gst.gov.in/services/auth/fowelcome',
+    Origin:  'https://services.gst.gov.in',
+  });
+  await page.goto('https://return.gst.gov.in/returns/auth/dashboard', {
+    waitUntil: 'load', timeout: 30000,
+  });
+
+  // Check for maintenance
+  const bodySnippet = (await page.locator('body').textContent().catch(() => '')).toLowerCase().slice(0, 2000);
+  if (bodySnippet.includes('under maintenance') || bodySnippet.includes('temporarily unavailable')) {
+    throw new Error('GST Portal is under maintenance. Please try again later.');
+  }
+
+  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+  await page.setExtraHTTPHeaders({});
+
+  // Dismiss any notification overlays (dimmer popups after login)
+  for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop', '.ui-dialog-titlebar-close']) {
+    try { await page.locator(sel).click({ timeout: 2000 }); } catch {}
+  }
+
+  // Wait for period dropdowns to be present
+  await page.waitForSelector('select[name="fin"]', { timeout: 15000 });
+  addLog(session, 'Returns Dashboard loaded ✅');
+}
+
+/**
+ * Core GSTR-2B download logic for a single period.
+ * Assumes the browser is already logged in and on (or can navigate to) the Returns Dashboard.
+ */
+async function downloadGSTR2BForPeriod(
+  session: Session,
+  period: string,
+  alreadyOnDashboard = false,
+): Promise<{ jsonBase64: string; filename: string; size: number }> {
+  const { page } = session;
+  const labels = periodToPortalLabels(period);
+
+  if (!alreadyOnDashboard) {
+    await navigateToReturnsDashboard(session);
+  }
+
+  // ── Select Financial Year ──────────────────────────────────────
+  addLog(session, `Selecting FY: ${labels.fySearchTexts[0]}`);
+  const fyOk = await selectByPartialLabel(page, 'select[name="fin"]', labels.fySearchTexts);
+  if (!fyOk) {
+    // Log available options for debugging
+    const opts = await page.evaluate(() => {
+      const sel = document.querySelector('select[name="fin"]') as HTMLSelectElement | null;
+      return sel ? Array.from(sel.options).map(o => o.text.trim()) : [];
+    });
+    throw new Error(`FY "${labels.fySearchTexts[0]}" not found. Available: ${opts.join(', ')}`);
+  }
+  await sleep(500);
+
+  // ── Select Quarter ─────────────────────────────────────────────
+  addLog(session, `Selecting Quarter: Q${labels.qNum}`);
+  const qOk = await selectByPartialLabel(page, 'select[name="quarter"]', labels.quarterSearchTexts);
+  if (!qOk) {
+    const opts = await page.evaluate(() => {
+      const sel = document.querySelector('select[name="quarter"]') as HTMLSelectElement | null;
+      return sel ? Array.from(sel.options).map(o => o.text.trim()) : [];
+    });
+    throw new Error(`Quarter Q${labels.qNum} not found. Available: ${opts.join(', ')}`);
+  }
+  await sleep(500);
+
+  // ── Select Month ───────────────────────────────────────────────
+  addLog(session, `Selecting Month: ${labels.monthName}`);
+  const mOk = await selectByPartialLabel(page, 'select[name="mon"]', labels.monthSearchTexts);
+  if (!mOk) {
+    const opts = await page.evaluate(() => {
+      const sel = document.querySelector('select[name="mon"]') as HTMLSelectElement | null;
+      return sel ? Array.from(sel.options).map(o => o.text.trim()) : [];
+    });
+    throw new Error(`Month "${labels.monthName}" not found. Available: ${opts.join(', ')}`);
+  }
+  await sleep(500);
+
+  // ── Click Search ───────────────────────────────────────────────
+  addLog(session, 'Clicking Search...');
+  await page.getByRole('button', { name: 'Search', exact: true }).click({ timeout: 5000 });
+  await sleep(3000); // Wait for tiles to load after search
+
+  // ── Find and click GSTR-2B Download button ────────────────────
+  addLog(session, 'Looking for GSTR-2B Download button...');
+  let downloadClicked = false;
+
+  // Strategy 1: Find the GSTR-2B section on the page and click its Download button
+  try {
+    downloadClicked = await page.evaluate(() => {
+      // The Returns Dashboard shows tiles/panels for each return type.
+      // Find elements containing "GSTR-2B" or "2B" and locate the nearest Download button.
+      const panels = Array.from(document.querySelectorAll(
+        '.panel, .card, [class*="tile"], [class*="return"], [class*="tbl-row"], tr, .row, .col-md-12 > div'
+      ));
+      for (const panel of panels) {
+        const text = panel.textContent || '';
+        if (/GSTR[\s-]*2B/i.test(text)) {
+          const btns = Array.from(panel.querySelectorAll('button, a'));
+          for (const btn of btns) {
+            if (/download/i.test(btn.textContent || '')) {
+              (btn as HTMLElement).click();
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    });
+    if (downloadClicked) addLog(session, 'GSTR-2B Download found via section text search');
+  } catch {}
+
+  // Strategy 2: Use nth(2) like the recording — GSTR-2B is typically the 3rd Download button
+  if (!downloadClicked) {
+    try {
+      await page.getByRole('button', { name: 'Download' }).nth(2).click({ timeout: 5000 });
+      downloadClicked = true;
+      addLog(session, 'GSTR-2B Download clicked via nth(2)');
+    } catch {}
+  }
+
+  // Strategy 3: Try all Download buttons
+  if (!downloadClicked) {
+    const count = await page.getByRole('button', { name: 'Download' }).count();
+    addLog(session, `Found ${count} Download buttons, trying each...`);
+    for (let i = 0; i < count; i++) {
+      try {
+        await page.getByRole('button', { name: 'Download' }).nth(i).click({ timeout: 3000 });
+        // Check if "GENERATE JSON FILE TO DOWNLOAD" appeared
+        await sleep(1000);
+        const hasGenerate = await page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' })
+          .isVisible({ timeout: 2000 }).catch(() => false);
+        if (hasGenerate) {
+          downloadClicked = true;
+          addLog(session, `Download button at index ${i} shows GENERATE JSON option`);
+          break;
+        }
+        // If wrong section, try going back
+        try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 2000 }); } catch {}
+        await sleep(500);
+      } catch {}
+    }
+  }
+
+  if (!downloadClicked) throw new Error('Could not find GSTR-2B Download button on Returns Dashboard');
+  await sleep(1500);
+
+  // ── Click GENERATE JSON FILE TO DOWNLOAD ─────────────────────
+  addLog(session, 'Clicking GENERATE JSON FILE TO DOWNLOAD...');
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: 60000 }),
+    page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' }).click({ timeout: 10000 }),
+  ]);
+
+  // ── Read the downloaded file ──────────────────────────────────
+  const dlPath = await download.path();
+  if (!dlPath) throw new Error('Download path was null');
+
+  const fileContent = fs.readFileSync(dlPath);
+  const filename = download.suggestedFilename() || `GSTR2B_${period}.json`;
+  const jsonBase64 = fileContent.toString('base64');
+  const size = fileContent.length;
+
+  addLog(session, `✅ GSTR-2B downloaded: ${filename} (${Math.round(size / 1024)} KB)`);
+
+  // ── Click BACK to return to dashboard for next download ───────
+  try {
+    await page.getByRole('button', { name: 'BACK' }).click({ timeout: 5000 });
+    await sleep(1500);
+  } catch {
+    addLog(session, 'BACK button not found — will re-navigate for next period');
+  }
+
+  return { jsonBase64, filename, size };
+}
+
+/**
+ * Bulk GSTR-2B download: runs async, downloads all requested periods sequentially.
+ * Progress is tracked via session.gstr2bDownloads array.
+ */
+async function runBulkGSTR2BDownload(session: Session, periods: string[]) {
+  try {
+    await navigateToReturnsDashboard(session);
+
+    for (const item of session.gstr2bDownloads!) {
+      if (session.state === 'error') break;
+      item.state = 'downloading';
+      addLog(session, `── Downloading GSTR-2B for ${item.period} ──`);
+
+      try {
+        const result = await downloadGSTR2BForPeriod(session, item.period, true);
+        item.jsonBase64 = result.jsonBase64;
+        item.filename = result.filename;
+        item.size = result.size;
+        item.state = 'done';
+      } catch (err: any) {
+        item.state = 'error';
+        item.error = err.message;
+        addLog(session, `❌ Failed for ${item.period}: ${err.message}`);
+        // Continue with next period instead of aborting entire bulk
+      }
+      await sleep(500);
+    }
+
+    session.state = 'done';
+    const doneCount = session.gstr2bDownloads!.filter(d => d.state === 'done').length;
+    const errCount = session.gstr2bDownloads!.filter(d => d.state === 'error').length;
+    addLog(session, `✅ Bulk download complete: ${doneCount} done, ${errCount} errors`);
+
+  } catch (err: any) {
+    session.state = 'error';
+    session.error = err.message;
+    addLog(session, `❌ Bulk download failed: ${err.message}`);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+
 // ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -896,12 +1219,13 @@ app.get('/session/:id/status', (req: Request, res: Response) => {
 
   // Map internal state → simplified API state
   const stateMap: Record<string, string> = {
-    captcha_pending: 'pending',
-    logging_in:      'pending',
-    ready:           'pending',
-    generating:      'generating',
-    done:            'done',
-    error:           'error',
+    captcha_pending:  'pending',
+    logging_in:       'pending',
+    ready:            'pending',
+    generating:       'generating',
+    downloading_2b:   'generating',
+    done:             'done',
+    error:            'error',
   };
 
   res.json({
@@ -968,6 +1292,104 @@ app.get('/payment/:cpin/status', async (req: Request, res: Response) => {
     // Portal may 401/403 for unauthenticated status check — return PENDING
     res.json({ cpin, status: 'PENDING', message: 'Status check unavailable — check GST portal.' });
   }
+});
+
+// ── POST /session/:id/download-2b ────────────────────────────────────────────
+// Download GSTR-2B JSON for a single period (synchronous — waits for download)
+// Body: { period: "MMYYYY" }  e.g. { period: "042026" }
+// Returns: { period, jsonBase64, filename, size }
+app.post('/session/:id/download-2b', async (req: Request, res: Response) => {
+  const session = sessions.get(String(req.params.id));
+  if (!session) return void res.status(404).json({ error: 'Session not found' });
+  if (session.state !== 'ready' && session.state !== 'done')
+    return void res.status(400).json({ error: `Session not ready (state: ${session.state}). Login first.` });
+
+  const { period } = req.body || {};
+  if (!period || !/^\d{6}$/.test(period))
+    return void res.status(400).json({ error: 'period required in MMYYYY format (e.g. "042026")' });
+
+  const mm = parseInt(period.slice(0, 2), 10);
+  if (mm < 1 || mm > 12)
+    return void res.status(400).json({ error: 'Invalid month in period' });
+
+  session.state = 'downloading_2b';
+  addLog(session, `Starting GSTR-2B download for period ${period}`);
+
+  try {
+    const result = await downloadGSTR2BForPeriod(session, period);
+    session.state = 'ready'; // Back to ready so more downloads can be done
+    res.json({ period, ...result });
+  } catch (err: any) {
+    session.state = 'ready'; // Don't lock session on single-download error
+    addLog(session, `GSTR-2B download error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /session/:id/download-2b-bulk ──────────────────────────────────────
+// Download GSTR-2B JSON for multiple periods (async — returns 202, poll status)
+// Body: { periods: ["042026", "052026", ...] }
+// Poll: GET /session/:id/download-2b/status
+app.post('/session/:id/download-2b-bulk', async (req: Request, res: Response) => {
+  const session = sessions.get(String(req.params.id));
+  if (!session) return void res.status(404).json({ error: 'Session not found' });
+  if (session.state !== 'ready' && session.state !== 'done')
+    return void res.status(400).json({ error: `Session not ready (state: ${session.state}). Login first.` });
+
+  const { periods } = req.body || {};
+  if (!Array.isArray(periods) || periods.length === 0)
+    return void res.status(400).json({ error: 'periods array required (e.g. ["042026","052026"])' });
+
+  // Validate all periods
+  for (const p of periods) {
+    if (!/^\d{6}$/.test(p)) return void res.status(400).json({ error: `Invalid period: "${p}"` });
+    const mm = parseInt(p.slice(0, 2), 10);
+    if (mm < 1 || mm > 12) return void res.status(400).json({ error: `Invalid month in period: "${p}"` });
+  }
+
+  // Initialize download tracking
+  session.gstr2bDownloads = periods.map((p: string) => ({
+    period: p, state: 'pending' as const,
+  }));
+  session.state = 'downloading_2b';
+  addLog(session, `Starting bulk GSTR-2B download for ${periods.length} periods`);
+
+  // Accept immediately — run in background
+  res.status(202).json({ ok: true, count: periods.length, message: 'Bulk download started — poll GET /session/:id/download-2b/status' });
+
+  runBulkGSTR2BDownload(session, periods).catch(err => {
+    session.state = 'error';
+    session.error = err.message;
+    addLog(session, `Unhandled bulk error: ${err.message}`);
+  });
+});
+
+// ── GET /session/:id/download-2b/status ─────────────────────────────────────
+// Poll bulk download progress
+app.get('/session/:id/download-2b/status', (req: Request, res: Response) => {
+  const session = sessions.get(String(req.params.id));
+  if (!session) return void res.status(404).json({ error: 'Session not found' });
+
+  const downloads = session.gstr2bDownloads || [];
+  const total = downloads.length;
+  const completed = downloads.filter(d => d.state === 'done').length;
+  const errors = downloads.filter(d => d.state === 'error').length;
+  const currentItem = downloads.find(d => d.state === 'downloading');
+
+  res.json({
+    state: session.state === 'downloading_2b' ? 'downloading' : session.state === 'done' ? 'done' : session.state,
+    progress: { total, completed, errors, currentPeriod: currentItem?.period },
+    downloads: downloads.map(d => ({
+      period: d.period,
+      state: d.state,
+      filename: d.filename,
+      size: d.size,
+      // Include jsonBase64 only for completed items
+      jsonBase64: d.state === 'done' ? d.jsonBase64 : undefined,
+      error: d.error,
+    })),
+    logs: session.logs.slice(-30),
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
