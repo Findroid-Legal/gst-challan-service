@@ -780,15 +780,65 @@ async function selectByPartialLabel(
  */
 async function navigateToReturnsDashboard(session: Session): Promise<void> {
   const { page } = session;
-
   addLog(session, 'Navigating to Returns Dashboard...');
-  await page.setExtraHTTPHeaders({
-    Referer: 'https://services.gst.gov.in/services/auth/fowelcome',
-    Origin:  'https://services.gst.gov.in',
-  });
-  await page.goto('https://return.gst.gov.in/returns/auth/dashboard', {
-    waitUntil: 'load', timeout: 30000,
-  });
+
+  // Strategy 1: Direct URL with SSO headers (works when already on return.gst.gov.in)
+  let dashboardLoaded = false;
+  try {
+    await page.setExtraHTTPHeaders({
+      Referer: 'https://services.gst.gov.in/services/auth/fowelcome',
+      Origin:  'https://services.gst.gov.in',
+    });
+    await page.goto('https://return.gst.gov.in/returns/auth/dashboard', {
+      waitUntil: 'load', timeout: 30000,
+    });
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    await page.setExtraHTTPHeaders({});
+
+    // Dismiss dimmers
+    for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop', '.ui-dialog-titlebar-close']) {
+      try { await page.locator(sel).click({ timeout: 1500 }); } catch {}
+    }
+
+    // Check if dropdown loaded
+    dashboardLoaded = await page.locator('select[name="fin"]').isVisible({ timeout: 8000 }).catch(() => false);
+  } catch {
+    addLog(session, 'Direct URL navigation failed, trying menu approach...');
+  }
+
+  // Strategy 2: Navigate via Services menu (from the recording)
+  if (!dashboardLoaded) {
+    addLog(session, 'Trying Services → Returns Dashboard menu...');
+    try {
+      // First go to the welcome page if not already there
+      if (!page.url().includes('services.gst.gov.in')) {
+        await page.goto('https://services.gst.gov.in/services/auth/fowelcome', {
+          waitUntil: 'load', timeout: 20000,
+        });
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+      }
+
+      // Dismiss dimmers
+      for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop']) {
+        try { await page.locator(sel).click({ timeout: 1500 }); } catch {}
+      }
+
+      // Click Services menu → Returns Dashboard
+      await page.getByRole('button', { name: 'Services' }).click({ timeout: 5000 });
+      await sleep(500);
+      await page.getByRole('link', { name: 'Returns Dashboard' }).click({ timeout: 5000 });
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+
+      // Dismiss dimmers again on the new page
+      for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop']) {
+        try { await page.locator(sel).click({ timeout: 1500 }); } catch {}
+      }
+
+      dashboardLoaded = await page.locator('select[name="fin"]').isVisible({ timeout: 10000 }).catch(() => false);
+    } catch (menuErr: any) {
+      addLog(session, `Menu navigation failed: ${menuErr.message}`);
+    }
+  }
 
   // Check for maintenance
   const bodySnippet = (await page.locator('body').textContent().catch(() => '')).toLowerCase().slice(0, 2000);
@@ -796,16 +846,15 @@ async function navigateToReturnsDashboard(session: Session): Promise<void> {
     throw new Error('GST Portal is under maintenance. Please try again later.');
   }
 
-  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-  await page.setExtraHTTPHeaders({});
-
-  // Dismiss any notification overlays (dimmer popups after login)
-  for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop', '.ui-dialog-titlebar-close']) {
-    try { await page.locator(sel).click({ timeout: 2000 }); } catch {}
+  if (!dashboardLoaded) {
+    // Last resort: try waiting longer with more dimmer dismissals
+    addLog(session, `Dashboard not loaded yet, URL: ${page.url()}`);
+    for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop']) {
+      try { await page.locator(sel).click({ timeout: 2000 }); } catch {}
+    }
+    await page.waitForSelector('select[name="fin"]', { timeout: 15000 });
   }
 
-  // Wait for period dropdowns to be present
-  await page.waitForSelector('select[name="fin"]', { timeout: 15000 });
   addLog(session, 'Returns Dashboard loaded ✅');
 }
 
