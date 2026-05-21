@@ -810,11 +810,12 @@ async function navigateToReturnsDashboard(session: Session): Promise<void> {
 }
 
 /** Return type → Download button index on the Returns Dashboard.
- *  Portal tile order: GSTR-1 (0), GSTR-3B (1), GSTR-2B (2) */
+ *  From Playwright recording: GSTR-1 nth(1), GSTR-2B nth(2).
+ *  nth(0) is some other button on the page. */
 type GSTReturnType = 'gstr1' | 'gstr2b' | 'gstr3b';
 const RETURN_BUTTON_INDEX: Record<GSTReturnType, number> = {
-  gstr1:  0,
-  gstr3b: 1,
+  gstr1:  1,
+  gstr3b: 0,   // TBD — needs testing
   gstr2b: 2,
 };
 const RETURN_LABEL: Record<GSTReturnType, string> = {
@@ -923,79 +924,136 @@ async function downloadReturnForPeriod(
   }
 
   if (!downloadClicked) throw new Error(`Could not find ${label} Download button on Returns Dashboard`);
-  await sleep(2000);
 
-  // ── Check page state before clicking GENERATE ─────────────────
-  // Log what's visible so we can debug issues
-  const pageTextBefore = (await page.locator('body').textContent().catch(() => '')).slice(0, 1000);
+  // Wait for download page to load
+  await sleep(3000);
+
+  // Dismiss dimmer overlays that appear after clicking Download
+  for (const sel of ['.dimmer-holder', '#dimmer', '.modal-backdrop']) {
+    try { await page.locator(sel).click({ timeout: 1500 }); } catch {}
+  }
+  await sleep(1000);
+
+  // ── Check page state — no data? ──────────────────────────────
+  const pageTextBefore = (await page.locator('body').textContent().catch(() => '')).replace(/\s+/g, ' ');
   if (/no\s*record/i.test(pageTextBefore) || /not\s*available/i.test(pageTextBefore) ||
       /no\s*data/i.test(pageTextBefore) || /statement\s*not\s*generated/i.test(pageTextBefore)) {
     addLog(session, `No ${label} data available for period ${period}`);
     try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 3000 }); } catch {}
+    try { await page.getByRole('button', { name: 'Back' }).click({ timeout: 3000 }); } catch {}
     throw new Error(`No ${label} data available for period ${period}`);
   }
 
-  // ── Click GENERATE JSON FILE TO DOWNLOAD ─────────────────────
-  addLog(session, 'Clicking GENERATE JSON FILE TO DOWNLOAD...');
-  const generateBtn = page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' });
-  if (!await generateBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-    // Maybe button has slightly different text — try partial matches
-    const altBtns = [
-      page.locator('button:has-text("GENERATE JSON")'),
-      page.locator('button:has-text("Generate JSON")'),
-      page.locator('button:has-text("JSON FILE")'),
-      page.locator('a:has-text("GENERATE JSON")'),
-    ];
-    let found = false;
-    for (const altBtn of altBtns) {
-      if (await altBtn.first().isVisible({ timeout: 1000 }).catch(() => false)) {
-        addLog(session, 'Found GENERATE button via fallback selector');
-        const [download] = await Promise.all([
-          page.waitForEvent('download', { timeout: 90000 }),
-          altBtn.first().click({ timeout: 5000 }),
-        ]);
-        const dlPath = await download.path();
-        if (!dlPath) throw new Error('Download path was null');
-        const fileContent = fs.readFileSync(dlPath);
-        const filename = download.suggestedFilename() || `${returnType.toUpperCase()}_${period}.json`;
-        addLog(session, `✅ ${label} downloaded: ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
-        try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 5000 }); } catch {}
-        await sleep(1500);
-        return { jsonBase64: fileContent.toString('base64'), filename, size: fileContent.length };
-      }
+  // ── GSTR-1 two-step flow vs GSTR-2B one-step flow ────────────
+  // GSTR-1: GENERATE creates the file on server, then "Click here to download" link appears
+  // GSTR-2B: GENERATE directly triggers a file download event
+  //
+  // Strategy for GSTR-1:
+  //   1. Check if "Click here to download" link already exists (previously generated)
+  //   2. If yes → click it directly (fast path)
+  //   3. If no → click GENERATE, wait for the link to appear, then click it
+
+  // Look for the "Click here to download" link (already-generated file)
+  const downloadLink = page.getByRole('link', { name: /Click here to download/i });
+  const hasExistingLink = await downloadLink.first().isVisible({ timeout: 2000 }).catch(() => false);
+
+  if (hasExistingLink && returnType === 'gstr1') {
+    // Fast path: file was already generated, just download it
+    addLog(session, 'Found existing download link — clicking directly');
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60000 }),
+      downloadLink.first().click({ timeout: 5000 }),
+    ]);
+    const dlPath = await download.path();
+    if (!dlPath) throw new Error('Download path was null');
+    const fileContent = fs.readFileSync(dlPath);
+    const filename = download.suggestedFilename() || `GSTR1_${period}.json`;
+    addLog(session, `✅ ${label} downloaded (cached): ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
+    try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 3000 }); } catch {}
+    try { await page.getByRole('button', { name: 'Back' }).click({ timeout: 3000 }); } catch {}
+    await sleep(1500);
+    return { jsonBase64: fileContent.toString('base64'), filename, size: fileContent.length };
+  }
+
+  // ── Find GENERATE button ──────────────────────────────────────
+  addLog(session, 'Looking for GENERATE JSON FILE TO DOWNLOAD button...');
+  const generateSelectors = [
+    page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' }),
+    page.getByRole('button', { name: 'Generate JSON File to Download' }),
+    page.locator('button:has-text("GENERATE JSON")'),
+    page.locator('button:has-text("Generate JSON")'),
+  ];
+  let generateBtn: ReturnType<typeof page.locator> | null = null;
+  for (const sel of generateSelectors) {
+    if (await sel.first().isVisible({ timeout: 1500 }).catch(() => false)) {
+      generateBtn = sel.first();
+      break;
     }
-    // Log page text for debugging
-    const bodyText = (await page.locator('body').textContent().catch(() => '')).slice(0, 500);
-    addLog(session, `Page text: ${bodyText.replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+  }
+  if (!generateBtn) {
+    // Log debugging info
+    const bodyText = (await page.locator('body').textContent().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 300);
+    addLog(session, `Page text: ${bodyText}`);
     throw new Error(`GENERATE JSON button not found after clicking ${label} Download`);
   }
 
-  // Main download path
-  const [download] = await Promise.all([
-    page.waitForEvent('download', { timeout: 90000 }),
-    generateBtn.click({ timeout: 5000 }),
-  ]);
+  if (returnType === 'gstr1') {
+    // ── GSTR-1: Click GENERATE, then wait for download link ─────
+    addLog(session, 'GSTR-1 flow: clicking GENERATE to create file...');
+    await generateBtn.click({ timeout: 5000 });
+    await sleep(3000);
 
-  // ── Read the downloaded file ──────────────────────────────────
-  const dlPath = await download.path();
-  if (!dlPath) throw new Error('Download path was null');
+    // Dismiss any dimmers
+    for (const sel of ['.dimmer-holder', '#dimmer']) {
+      try { await page.locator(sel).click({ timeout: 1500 }); } catch {}
+    }
 
-  const fileContent = fs.readFileSync(dlPath);
-  const filename = download.suggestedFilename() || `${returnType.toUpperCase()}_${period}.json`;
-  const jsonBase64 = fileContent.toString('base64');
-  const size = fileContent.length;
+    // Wait for download link to appear (may take a while if generating fresh)
+    addLog(session, 'Waiting for download link to appear...');
+    const dlLink = page.getByRole('link', { name: /Click here to download/i });
+    const linkAppeared = await dlLink.first().isVisible({ timeout: 120000 }).catch(() => false);
 
-  addLog(session, `✅ ${label} downloaded: ${filename} (${Math.round(size / 1024)} KB)`);
+    if (!linkAppeared) {
+      throw new Error(`GSTR-1 file generation timed out for period ${period} — try again later`);
+    }
 
-  // ── Click BACK to return to dashboard for next download ───────
-  try {
-    await page.getByRole('button', { name: 'BACK' }).click({ timeout: 5000 });
+    addLog(session, 'Download link appeared — clicking...');
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 60000 }),
+      dlLink.first().click({ timeout: 5000 }),
+    ]);
+    const dlPath = await download.path();
+    if (!dlPath) throw new Error('Download path was null');
+    const fileContent = fs.readFileSync(dlPath);
+    const filename = download.suggestedFilename() || `GSTR1_${period}.json`;
+    addLog(session, `✅ ${label} downloaded: ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
+    try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 3000 }); } catch {}
+    try { await page.getByRole('button', { name: 'Back' }).click({ timeout: 3000 }); } catch {}
     await sleep(1500);
-  } catch {
-    addLog(session, 'BACK button not found — will re-navigate for next period');
-  }
+    return { jsonBase64: fileContent.toString('base64'), filename, size: fileContent.length };
 
-  return { jsonBase64, filename, size };
+  } else {
+    // ── GSTR-2B / GSTR-3B: GENERATE directly triggers download ──
+    const [download] = await Promise.all([
+      page.waitForEvent('download', { timeout: 90000 }),
+      generateBtn.click({ timeout: 5000 }),
+    ]);
+    const dlPath = await download.path();
+    if (!dlPath) throw new Error('Download path was null');
+    const fileContent = fs.readFileSync(dlPath);
+    const filename = download.suggestedFilename() || `${returnType.toUpperCase()}_${period}.json`;
+    addLog(session, `✅ ${label} downloaded: ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
+
+    // Click BACK to return to dashboard for next download
+    try {
+      await page.getByRole('button', { name: 'BACK' }).click({ timeout: 5000 });
+      await sleep(1500);
+    } catch {
+      addLog(session, 'BACK button not found — will re-navigate for next period');
+    }
+
+    return { jsonBase64: fileContent.toString('base64'), filename, size: fileContent.length };
+  }
 }
 
 /**
