@@ -868,60 +868,37 @@ async function downloadGSTR2BForPeriod(
   await sleep(3000); // Wait for tiles to load after search
 
   // ── Find and click GSTR-2B Download button ────────────────────
+  // The recording shows this is the 3rd "Download" button (.nth(2)) on the Returns Dashboard.
+  // We try nth(2) first (most reliable from the recording), then fallback strategies.
   addLog(session, 'Looking for GSTR-2B Download button...');
   let downloadClicked = false;
 
-  // Strategy 1: Find the GSTR-2B section on the page and click its Download button
+  // Strategy 1: Use nth(2) like the recording — GSTR-2B is typically the 3rd Download button
   try {
-    downloadClicked = await page.evaluate(() => {
-      // The Returns Dashboard shows tiles/panels for each return type.
-      // Find elements containing "GSTR-2B" or "2B" and locate the nearest Download button.
-      const panels = Array.from(document.querySelectorAll(
-        '.panel, .card, [class*="tile"], [class*="return"], [class*="tbl-row"], tr, .row, .col-md-12 > div'
-      ));
-      for (const panel of panels) {
-        const text = panel.textContent || '';
-        if (/GSTR[\s-]*2B/i.test(text)) {
-          const btns = Array.from(panel.querySelectorAll('button, a'));
-          for (const btn of btns) {
-            if (/download/i.test(btn.textContent || '')) {
-              (btn as HTMLElement).click();
-              return true;
-            }
-          }
-        }
-      }
-      return false;
-    });
-    if (downloadClicked) addLog(session, 'GSTR-2B Download found via section text search');
-  } catch {}
-
-  // Strategy 2: Use nth(2) like the recording — GSTR-2B is typically the 3rd Download button
-  if (!downloadClicked) {
-    try {
-      await page.getByRole('button', { name: 'Download' }).nth(2).click({ timeout: 5000 });
+    const btn = page.getByRole('button', { name: 'Download' }).nth(2);
+    if (await btn.isVisible({ timeout: 3000 })) {
+      await btn.click({ timeout: 5000 });
       downloadClicked = true;
       addLog(session, 'GSTR-2B Download clicked via nth(2)');
-    } catch {}
-  }
+    }
+  } catch {}
 
-  // Strategy 3: Try all Download buttons
+  // Strategy 2: Try all Download buttons and check which leads to GENERATE JSON
   if (!downloadClicked) {
     const count = await page.getByRole('button', { name: 'Download' }).count();
-    addLog(session, `Found ${count} Download buttons, trying each...`);
+    addLog(session, `Trying ${count} Download buttons to find GSTR-2B...`);
     for (let i = 0; i < count; i++) {
       try {
         await page.getByRole('button', { name: 'Download' }).nth(i).click({ timeout: 3000 });
-        // Check if "GENERATE JSON FILE TO DOWNLOAD" appeared
-        await sleep(1000);
+        await sleep(2000);
         const hasGenerate = await page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' })
-          .isVisible({ timeout: 2000 }).catch(() => false);
+          .isVisible({ timeout: 3000 }).catch(() => false);
         if (hasGenerate) {
           downloadClicked = true;
-          addLog(session, `Download button at index ${i} shows GENERATE JSON option`);
+          addLog(session, `Download button at index ${i} leads to GENERATE JSON page`);
           break;
         }
-        // If wrong section, try going back
+        // Wrong section — go back
         try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 2000 }); } catch {}
         await sleep(500);
       } catch {}
@@ -929,13 +906,58 @@ async function downloadGSTR2BForPeriod(
   }
 
   if (!downloadClicked) throw new Error('Could not find GSTR-2B Download button on Returns Dashboard');
-  await sleep(1500);
+  await sleep(2000);
+
+  // ── Check page state before clicking GENERATE ─────────────────
+  // Log what's visible so we can debug issues
+  const pageTextBefore = (await page.locator('body').textContent().catch(() => '')).slice(0, 1000);
+  if (/no\s*record/i.test(pageTextBefore) || /not\s*available/i.test(pageTextBefore) ||
+      /no\s*data/i.test(pageTextBefore) || /statement\s*not\s*generated/i.test(pageTextBefore)) {
+    addLog(session, `No GSTR-2B data available for period ${period}`);
+    // Try to go back for next period
+    try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 3000 }); } catch {}
+    throw new Error(`No GSTR-2B data available for period ${period}`);
+  }
 
   // ── Click GENERATE JSON FILE TO DOWNLOAD ─────────────────────
   addLog(session, 'Clicking GENERATE JSON FILE TO DOWNLOAD...');
+  const generateBtn = page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' });
+  if (!await generateBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+    // Maybe button has slightly different text — try partial matches
+    const altBtns = [
+      page.locator('button:has-text("GENERATE JSON")'),
+      page.locator('button:has-text("Generate JSON")'),
+      page.locator('button:has-text("JSON FILE")'),
+      page.locator('a:has-text("GENERATE JSON")'),
+    ];
+    let found = false;
+    for (const altBtn of altBtns) {
+      if (await altBtn.first().isVisible({ timeout: 1000 }).catch(() => false)) {
+        addLog(session, 'Found GENERATE button via fallback selector');
+        const [download] = await Promise.all([
+          page.waitForEvent('download', { timeout: 90000 }),
+          altBtn.first().click({ timeout: 5000 }),
+        ]);
+        const dlPath = await download.path();
+        if (!dlPath) throw new Error('Download path was null');
+        const fileContent = fs.readFileSync(dlPath);
+        const filename = download.suggestedFilename() || `GSTR2B_${period}.json`;
+        addLog(session, `✅ GSTR-2B downloaded: ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
+        try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 5000 }); } catch {}
+        await sleep(1500);
+        return { jsonBase64: fileContent.toString('base64'), filename, size: fileContent.length };
+      }
+    }
+    // Log page text for debugging
+    const bodyText = (await page.locator('body').textContent().catch(() => '')).slice(0, 500);
+    addLog(session, `Page text: ${bodyText.replace(/\s+/g, ' ').trim().slice(0, 200)}`);
+    throw new Error('GENERATE JSON button not found after clicking Download');
+  }
+
+  // Main download path
   const [download] = await Promise.all([
-    page.waitForEvent('download', { timeout: 60000 }),
-    page.getByRole('button', { name: 'GENERATE JSON FILE TO DOWNLOAD' }).click({ timeout: 10000 }),
+    page.waitForEvent('download', { timeout: 90000 }),
+    generateBtn.click({ timeout: 5000 }),
   ]);
 
   // ── Read the downloaded file ──────────────────────────────────
