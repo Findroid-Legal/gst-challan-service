@@ -809,13 +809,29 @@ async function navigateToReturnsDashboard(session: Session): Promise<void> {
   addLog(session, 'Returns Dashboard loaded ✅');
 }
 
+/** Return type → Download button index on the Returns Dashboard.
+ *  Portal tile order: GSTR-1 (0), GSTR-3B (1), GSTR-2B (2) */
+type GSTReturnType = 'gstr1' | 'gstr2b' | 'gstr3b';
+const RETURN_BUTTON_INDEX: Record<GSTReturnType, number> = {
+  gstr1:  0,
+  gstr3b: 1,
+  gstr2b: 2,
+};
+const RETURN_LABEL: Record<GSTReturnType, string> = {
+  gstr1:  'GSTR-1',
+  gstr3b: 'GSTR-3B',
+  gstr2b: 'GSTR-2B',
+};
+
 /**
- * Core GSTR-2B download logic for a single period.
+ * Core GST return JSON download logic for a single period.
+ * Works for GSTR-1, GSTR-2B, and GSTR-3B — just changes which Download button is clicked.
  * Assumes the browser is already logged in and on (or can navigate to) the Returns Dashboard.
  */
-async function downloadGSTR2BForPeriod(
+async function downloadReturnForPeriod(
   session: Session,
   period: string,
+  returnType: GSTReturnType = 'gstr2b',
   alreadyOnDashboard = false,
 ): Promise<{ jsonBase64: string; filename: string; size: number }> {
   const { page } = session;
@@ -867,26 +883,27 @@ async function downloadGSTR2BForPeriod(
   await page.getByRole('button', { name: 'Search', exact: true }).click({ timeout: 5000 });
   await sleep(3000); // Wait for tiles to load after search
 
-  // ── Find and click GSTR-2B Download button ────────────────────
-  // The recording shows this is the 3rd "Download" button (.nth(2)) on the Returns Dashboard.
-  // We try nth(2) first (most reliable from the recording), then fallback strategies.
-  addLog(session, 'Looking for GSTR-2B Download button...');
+  // ── Find and click the return type's Download button ────────────
+  // Portal tile order: GSTR-1 (0), GSTR-3B (1), GSTR-2B (2)
+  const btnIndex = RETURN_BUTTON_INDEX[returnType];
+  const label = RETURN_LABEL[returnType];
+  addLog(session, `Looking for ${label} Download button (index ${btnIndex})...`);
   let downloadClicked = false;
 
-  // Strategy 1: Use nth(2) like the recording — GSTR-2B is typically the 3rd Download button
+  // Strategy 1: Use the known index for this return type
   try {
-    const btn = page.getByRole('button', { name: 'Download' }).nth(2);
+    const btn = page.getByRole('button', { name: 'Download' }).nth(btnIndex);
     if (await btn.isVisible({ timeout: 3000 })) {
       await btn.click({ timeout: 5000 });
       downloadClicked = true;
-      addLog(session, 'GSTR-2B Download clicked via nth(2)');
+      addLog(session, `${label} Download clicked via nth(${btnIndex})`);
     }
   } catch {}
 
   // Strategy 2: Try all Download buttons and check which leads to GENERATE JSON
   if (!downloadClicked) {
     const count = await page.getByRole('button', { name: 'Download' }).count();
-    addLog(session, `Trying ${count} Download buttons to find GSTR-2B...`);
+    addLog(session, `Trying ${count} Download buttons to find ${label}...`);
     for (let i = 0; i < count; i++) {
       try {
         await page.getByRole('button', { name: 'Download' }).nth(i).click({ timeout: 3000 });
@@ -905,7 +922,7 @@ async function downloadGSTR2BForPeriod(
     }
   }
 
-  if (!downloadClicked) throw new Error('Could not find GSTR-2B Download button on Returns Dashboard');
+  if (!downloadClicked) throw new Error(`Could not find ${label} Download button on Returns Dashboard`);
   await sleep(2000);
 
   // ── Check page state before clicking GENERATE ─────────────────
@@ -913,10 +930,9 @@ async function downloadGSTR2BForPeriod(
   const pageTextBefore = (await page.locator('body').textContent().catch(() => '')).slice(0, 1000);
   if (/no\s*record/i.test(pageTextBefore) || /not\s*available/i.test(pageTextBefore) ||
       /no\s*data/i.test(pageTextBefore) || /statement\s*not\s*generated/i.test(pageTextBefore)) {
-    addLog(session, `No GSTR-2B data available for period ${period}`);
-    // Try to go back for next period
+    addLog(session, `No ${label} data available for period ${period}`);
     try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 3000 }); } catch {}
-    throw new Error(`No GSTR-2B data available for period ${period}`);
+    throw new Error(`No ${label} data available for period ${period}`);
   }
 
   // ── Click GENERATE JSON FILE TO DOWNLOAD ─────────────────────
@@ -941,8 +957,8 @@ async function downloadGSTR2BForPeriod(
         const dlPath = await download.path();
         if (!dlPath) throw new Error('Download path was null');
         const fileContent = fs.readFileSync(dlPath);
-        const filename = download.suggestedFilename() || `GSTR2B_${period}.json`;
-        addLog(session, `✅ GSTR-2B downloaded: ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
+        const filename = download.suggestedFilename() || `${returnType.toUpperCase()}_${period}.json`;
+        addLog(session, `✅ ${label} downloaded: ${filename} (${Math.round(fileContent.length / 1024)} KB)`);
         try { await page.getByRole('button', { name: 'BACK' }).click({ timeout: 5000 }); } catch {}
         await sleep(1500);
         return { jsonBase64: fileContent.toString('base64'), filename, size: fileContent.length };
@@ -951,7 +967,7 @@ async function downloadGSTR2BForPeriod(
     // Log page text for debugging
     const bodyText = (await page.locator('body').textContent().catch(() => '')).slice(0, 500);
     addLog(session, `Page text: ${bodyText.replace(/\s+/g, ' ').trim().slice(0, 200)}`);
-    throw new Error('GENERATE JSON button not found after clicking Download');
+    throw new Error(`GENERATE JSON button not found after clicking ${label} Download`);
   }
 
   // Main download path
@@ -965,11 +981,11 @@ async function downloadGSTR2BForPeriod(
   if (!dlPath) throw new Error('Download path was null');
 
   const fileContent = fs.readFileSync(dlPath);
-  const filename = download.suggestedFilename() || `GSTR2B_${period}.json`;
+  const filename = download.suggestedFilename() || `${returnType.toUpperCase()}_${period}.json`;
   const jsonBase64 = fileContent.toString('base64');
   const size = fileContent.length;
 
-  addLog(session, `✅ GSTR-2B downloaded: ${filename} (${Math.round(size / 1024)} KB)`);
+  addLog(session, `✅ ${label} downloaded: ${filename} (${Math.round(size / 1024)} KB)`);
 
   // ── Click BACK to return to dashboard for next download ───────
   try {
@@ -986,17 +1002,18 @@ async function downloadGSTR2BForPeriod(
  * Bulk GSTR-2B download: runs async, downloads all requested periods sequentially.
  * Progress is tracked via session.gstr2bDownloads array.
  */
-async function runBulkGSTR2BDownload(session: Session, periods: string[]) {
+async function runBulkGSTR2BDownload(session: Session, periods: string[], returnType: GSTReturnType = 'gstr2b') {
+  const label = RETURN_LABEL[returnType];
   try {
     await navigateToReturnsDashboard(session);
 
     for (const item of session.gstr2bDownloads!) {
       if (session.state === 'error') break;
       item.state = 'downloading';
-      addLog(session, `── Downloading GSTR-2B for ${item.period} ──`);
+      addLog(session, `── Downloading ${label} for ${item.period} ──`);
 
       try {
-        const result = await downloadGSTR2BForPeriod(session, item.period, true);
+        const result = await downloadReturnForPeriod(session, item.period, returnType, true);
         item.jsonBase64 = result.jsonBase64;
         item.filename = result.filename;
         item.size = result.size;
@@ -1316,11 +1333,46 @@ app.get('/payment/:cpin/status', async (req: Request, res: Response) => {
   }
 });
 
-// ── POST /session/:id/download-2b ────────────────────────────────────────────
-// Download GSTR-2B JSON for a single period (synchronous — waits for download)
-// Body: { period: "MMYYYY" }  e.g. { period: "042026" }
-// Returns: { period, jsonBase64, filename, size }
+// ── POST /session/:id/download-return ────────────────────────────────────────
+// Download GST return JSON for a single period (synchronous — waits for download)
+// Body: { period: "MMYYYY", returnType?: "gstr1"|"gstr2b"|"gstr3b" }
+// returnType defaults to "gstr2b" for backward compat
+// Returns: { period, returnType, jsonBase64, filename, size }
+app.post('/session/:id/download-return', async (req: Request, res: Response) => {
+  const session = sessions.get(String(req.params.id));
+  if (!session) return void res.status(404).json({ error: 'Session not found' });
+  if (session.state !== 'ready' && session.state !== 'done')
+    return void res.status(400).json({ error: `Session not ready (state: ${session.state}). Login first.` });
+
+  const { period, returnType = 'gstr2b' } = req.body || {};
+  if (!period || !/^\d{6}$/.test(period))
+    return void res.status(400).json({ error: 'period required in MMYYYY format (e.g. "042026")' });
+  if (!['gstr1', 'gstr2b', 'gstr3b'].includes(returnType))
+    return void res.status(400).json({ error: 'returnType must be gstr1, gstr2b, or gstr3b' });
+
+  const mm = parseInt(period.slice(0, 2), 10);
+  if (mm < 1 || mm > 12)
+    return void res.status(400).json({ error: 'Invalid month in period' });
+
+  const label = RETURN_LABEL[returnType as GSTReturnType];
+  session.state = 'downloading_2b';
+  addLog(session, `Starting ${label} download for period ${period}`);
+
+  try {
+    const result = await downloadReturnForPeriod(session, period, returnType as GSTReturnType);
+    session.state = 'ready';
+    res.json({ period, returnType, ...result });
+  } catch (err: any) {
+    session.state = 'ready';
+    addLog(session, `${label} download error: ${err.message}`);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Backward-compat alias: /download-2b → /download-return with returnType=gstr2b
 app.post('/session/:id/download-2b', async (req: Request, res: Response) => {
+  req.body = { ...req.body, returnType: 'gstr2b' };
+  // Forward to the generic handler
   const session = sessions.get(String(req.params.id));
   if (!session) return void res.status(404).json({ error: 'Session not found' });
   if (session.state !== 'ready' && session.state !== 'done')
@@ -1330,28 +1382,55 @@ app.post('/session/:id/download-2b', async (req: Request, res: Response) => {
   if (!period || !/^\d{6}$/.test(period))
     return void res.status(400).json({ error: 'period required in MMYYYY format (e.g. "042026")' });
 
-  const mm = parseInt(period.slice(0, 2), 10);
-  if (mm < 1 || mm > 12)
-    return void res.status(400).json({ error: 'Invalid month in period' });
-
   session.state = 'downloading_2b';
   addLog(session, `Starting GSTR-2B download for period ${period}`);
-
   try {
-    const result = await downloadGSTR2BForPeriod(session, period);
-    session.state = 'ready'; // Back to ready so more downloads can be done
+    const result = await downloadReturnForPeriod(session, period, 'gstr2b');
+    session.state = 'ready';
     res.json({ period, ...result });
   } catch (err: any) {
-    session.state = 'ready'; // Don't lock session on single-download error
-    addLog(session, `GSTR-2B download error: ${err.message}`);
+    session.state = 'ready';
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── POST /session/:id/download-2b-bulk ──────────────────────────────────────
-// Download GSTR-2B JSON for multiple periods (async — returns 202, poll status)
-// Body: { periods: ["042026", "052026", ...] }
+// ── POST /session/:id/download-return-bulk ──────────────────────────────────
+// Download GST return JSON for multiple periods (async — returns 202, poll status)
+// Body: { periods: ["042026", ...], returnType?: "gstr1"|"gstr2b"|"gstr3b" }
 // Poll: GET /session/:id/download-2b/status
+app.post('/session/:id/download-return-bulk', async (req: Request, res: Response) => {
+  const session = sessions.get(String(req.params.id));
+  if (!session) return void res.status(404).json({ error: 'Session not found' });
+  if (session.state !== 'ready' && session.state !== 'done')
+    return void res.status(400).json({ error: `Session not ready (state: ${session.state}). Login first.` });
+
+  const { periods, returnType = 'gstr2b' } = req.body || {};
+  if (!Array.isArray(periods) || periods.length === 0)
+    return void res.status(400).json({ error: 'periods array required' });
+  if (!['gstr1', 'gstr2b', 'gstr3b'].includes(returnType))
+    return void res.status(400).json({ error: 'returnType must be gstr1, gstr2b, or gstr3b' });
+
+  for (const p of periods) {
+    if (!/^\d{6}$/.test(p)) return void res.status(400).json({ error: `Invalid period: "${p}"` });
+    const mm = parseInt(p.slice(0, 2), 10);
+    if (mm < 1 || mm > 12) return void res.status(400).json({ error: `Invalid month in period: "${p}"` });
+  }
+
+  const label = RETURN_LABEL[returnType as GSTReturnType];
+  session.gstr2bDownloads = periods.map((p: string) => ({ period: p, state: 'pending' as const }));
+  session.state = 'downloading_2b';
+  addLog(session, `Starting bulk ${label} download for ${periods.length} periods`);
+
+  res.status(202).json({ ok: true, count: periods.length });
+
+  runBulkGSTR2BDownload(session, periods, returnType as GSTReturnType).catch(err => {
+    session.state = 'error';
+    session.error = err.message;
+    addLog(session, `Unhandled bulk error: ${err.message}`);
+  });
+});
+
+// Backward-compat alias: /download-2b-bulk → /download-return-bulk with returnType=gstr2b
 app.post('/session/:id/download-2b-bulk', async (req: Request, res: Response) => {
   const session = sessions.get(String(req.params.id));
   if (!session) return void res.status(404).json({ error: 'Session not found' });
@@ -1360,26 +1439,21 @@ app.post('/session/:id/download-2b-bulk', async (req: Request, res: Response) =>
 
   const { periods } = req.body || {};
   if (!Array.isArray(periods) || periods.length === 0)
-    return void res.status(400).json({ error: 'periods array required (e.g. ["042026","052026"])' });
+    return void res.status(400).json({ error: 'periods array required' });
 
-  // Validate all periods
   for (const p of periods) {
     if (!/^\d{6}$/.test(p)) return void res.status(400).json({ error: `Invalid period: "${p}"` });
     const mm = parseInt(p.slice(0, 2), 10);
     if (mm < 1 || mm > 12) return void res.status(400).json({ error: `Invalid month in period: "${p}"` });
   }
 
-  // Initialize download tracking
-  session.gstr2bDownloads = periods.map((p: string) => ({
-    period: p, state: 'pending' as const,
-  }));
+  session.gstr2bDownloads = periods.map((p: string) => ({ period: p, state: 'pending' as const }));
   session.state = 'downloading_2b';
   addLog(session, `Starting bulk GSTR-2B download for ${periods.length} periods`);
 
-  // Accept immediately — run in background
-  res.status(202).json({ ok: true, count: periods.length, message: 'Bulk download started — poll GET /session/:id/download-2b/status' });
+  res.status(202).json({ ok: true, count: periods.length });
 
-  runBulkGSTR2BDownload(session, periods).catch(err => {
+  runBulkGSTR2BDownload(session, periods, 'gstr2b').catch(err => {
     session.state = 'error';
     session.error = err.message;
     addLog(session, `Unhandled bulk error: ${err.message}`);
